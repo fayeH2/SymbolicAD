@@ -1,0 +1,154 @@
+{
+  "schema_version": "6.0-multidataset-registry",
+  "defaults": {
+    "shot": 4,
+    "support_seed": 1,
+    "llm_model": "/home/hjh/AgentModels/Qwen3-VL-8B-Thinking",
+    "inpformer_root": "/home/hjh/Desktop/H2VLR_compare/INP-Former",
+    "checkpoint_root": "/home/hjh/Desktop/H2VLR_compare/INP-Former/saved_results"
+  },
+  "datasets": [
+    {
+      "id": "mvtec",
+      "display_name": "MVTec AD",
+      "domain": "industrial",
+      "status": "ready",
+      "data_root": "/home/hjh/Desktop/0Datasets/anomaly/industrial/MVTec",
+      "classes": ["carpet", "grid", "leather", "tile", "wood", "bottle", "cable", "capsule", "hazelnut", "metal_nut", "pill", "screw", "toothbrush", "transistor", "zipper"],
+      "test_subdir": "test",
+      "checkpoint": "/home/hjh/Desktop/H2VLR_compare/INP-Former/saved_results/INP-Former-Few-Shot-{shot}_dataset=MVTec-AD_Encoder=dinov2reg_vit_base_14_Resize=448_Crop=392_INP_num=6/model.pth",
+      "baseline_trainer": "official_few_shot",
+      "trainer_dataset": "MVTec-AD"
+    },
+    {
+      "id": "visa",
+      "display_name": "VisA",
+      "domain": "industrial",
+      "status": "ready",
+      "data_root": "/home/hjh/Desktop/0Datasets/anomaly/industrial/VisA",
+      "classes": ["candle", "capsules", "cashew", "chewinggum", "fryum", "macaroni1", "macaroni2", "pcb1", "pcb2", "pcb3", "pcb4", "pipe_fryum"],
+      "test_subdir": "test",
+      "checkpoint": "/home/hjh/Desktop/H2VLR_compare/INP-Former/saved_results/INP-Former-Few-Shot-{shot}_dataset=VisA_Encoder=dinov2reg_vit_base_14_Resize=448_Crop=392_INP_num=6/model.pth",
+      "baseline_trainer": "official_few_shot",
+      "trainer_dataset": "VisA"
+    },
+    {
+      "id": "btad",
+      "display_name": "BTAD",
+      "domain": "industrial",
+      "status": "ready",
+      "data_root": "/home/hjh/Desktop/0Datasets/anomaly/industrial/BTAD",
+      "classes": ["01", "02", "03"],
+      "test_subdir": "test",
+      "checkpoint": "/home/hjh/Desktop/H2VLR_compare/INP-Former/saved_results/INP-Former-Industrial-btad-{shot}/model.pth",
+      "baseline_trainer": "official_industrial"
+    },
+    {
+      "id": "mpdd",
+      "display_name": "MPDD",
+      "domain": "industrial",
+      "status": "ready",
+      "data_root": "/home/hjh/Desktop/0Datasets/anomaly/industrial/MPDD",
+      "classes": ["bracket_black", "bracket_brown", "bracket_white", "connector", "metal_plate", "tubes"],
+      "test_subdir": "test",
+      "checkpoint": "/home/hjh/Desktop/H2VLR_compare/INP-Former/saved_results/INP-Former-Industrial-mpdd-{shot}/model.pth",
+      "baseline_trainer": "official_industrial"
+    },
+    {
+      "id": "beltad",
+      "display_name": "BeltAD",
+      "domain": "industrial",
+      "status": "ready",
+      "data_root": "/home/hjh/Desktop/0Datasets/anomaly/industrial/BeltAD",
+      "classes": ["belt"],
+      "test_subdir": "test",
+      "checkpoint": "/home/hjh/Desktop/H2VLR_compare/INP-Former/saved_results/INP-Former-Industrial-beltad-{shot}/model.pth",
+      "baseline_trainer": "official_industrial"
+    },
+    {
+      "id": "mvtec2",
+      "display_name": "MVTec AD 2 (public test)",
+      "domain": "industrial",
+      "status": "experimental_trainable",
+      "data_root": "/home/hjh/Desktop/0Datasets/anomaly/industrial/MVTec2",
+      "classes": ["can", "fabric", "fruit_jelly", "rice", "sheet_metal", "vial", "wallplugs", "walnuts"],
+      "test_subdir": "test_public",
+      "checkpoint": "/home/hjh/Desktop/NeuroSymbolic_FSAD/artifacts/baselines/mvtec2/k{shot}/model.pth",
+      "baseline_trainer": "isolated_generic"
+    },
+    {
+      "id": "mvtec_loco",
+      "display_name": "MVTec LOCO AD",
+      "domain": "industrial",
+      "status": "experimental_trainable",
+      "data_root": "/home/hjh/Desktop/0Datasets/anomaly/industrial/MVTecLOCO/MVTecLOCO",
+      "classes": ["breakfast_box", "juice_bottle", "pushpins", "screw_bag", "splicing_connectors"],
+      "test_subdir": "test",
+      "checkpoint": "/home/hjh/Desktop/NeuroSymbolic_FSAD/artifacts/baselines/mvtec_loco/k{shot}/model.pth",
+      "baseline_trainer": "isolated_generic"
+    },
+    {
+      "id": "vidad",
+      "display_name": "VID-AD (all base and domain-shift folders)",
+      "domain": "industrial",
+      "status": "experimental_trainable",
+      "data_root": "/home/hjh/Desktop/0Datasets/anomaly/industrial/VID-AD",
+      "classes": "discover_mvt_like",
+      "test_subdir": "test",
+      "checkpoint": "/home/hjh/Desktop/NeuroSymbolic_FSAD/artifacts/baselines/vidad/k{shot}/model.pth",
+      "baseline_trainer": "isolated_generic",
+      "proposal_shards": 2
+    },
+    {
+      "id": "iedxray",
+      "display_name": "IEDXray",
+      "domain": "industrial",
+      "status": "incompatible",
+      "data_root": "/home/hjh/Desktop/0Datasets/anomaly/industrial/IEDXray",
+      "classes": [],
+      "reason": "Object-detection Train/Test/annotations layout has no normal-only FSAD support split or anomaly masks; it needs a separately defined conversion protocol."
+    },
+    {
+      "id": "sixray",
+      "display_name": "SIXray",
+      "domain": "industrial",
+      "status": "incompatible",
+      "data_root": "/home/hjh/Desktop/0Datasets/anomaly/industrial/SIXray",
+      "classes": [],
+      "reason": "Only archive files are present and SIXray is an X-ray recognition dataset, not a class/train/good + class/test anomaly benchmark."
+    },
+    {
+      "id": "brainmri",
+      "display_name": "BrainMRI",
+      "domain": "medical",
+      "status": "ready",
+      "data_root": "/home/hjh/Desktop/0Datasets/anomaly/medical/BrainMRI",
+      "classes": ["brain"],
+      "test_subdir": "test",
+      "checkpoint": "/home/hjh/Desktop/H2VLR_compare/INP-Former/saved_results/INP-Former-Medical-brainmri-{shot}/model.pth",
+      "baseline_trainer": "official_medical"
+    },
+    {
+      "id": "liverct",
+      "display_name": "LiverCT",
+      "domain": "medical",
+      "status": "ready",
+      "data_root": "/home/hjh/Desktop/0Datasets/anomaly/medical/LiverCT",
+      "classes": ["liver"],
+      "test_subdir": "test",
+      "checkpoint": "/home/hjh/Desktop/H2VLR_compare/INP-Former/saved_results/INP-Former-Medical-liverct-{shot}/model.pth",
+      "baseline_trainer": "official_medical"
+    },
+    {
+      "id": "busi",
+      "display_name": "BUSI",
+      "domain": "medical",
+      "status": "ready",
+      "data_root": "/home/hjh/Desktop/0Datasets/anomaly/medical/BUSI",
+      "classes": ["breast"],
+      "test_subdir": "test",
+      "checkpoint": "/home/hjh/Desktop/H2VLR_compare/INP-Former/saved_results/INP-Former-Medical-busi-{shot}/model.pth",
+      "baseline_trainer": "official_medical"
+    }
+  ]
+}

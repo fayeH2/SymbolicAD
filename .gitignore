@@ -1,0 +1,100 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Distribution / Packaging
+.Python
+build/
+dist/
+*.egg-info/
+
+# PyTest
+.pytest_cache/
+.coverage
+
+# Results and outputs - exclude all
+results*/
+results_*/
+results_loco*/
+results_loco_experiment/
+results_v*/
+artifacts/
+cache/
+backups/
+
+# Logs
+*.log
+master*.log
+evolutionary*.log
+
+# Model checkpoints
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.bin
+
+# NumPy / binary outputs
+*.npz
+*.npy
+
+# Model checkpoints
+*.pth
+*.pt
+
+# Data
+data/
+datasets/
+*.csv
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+
+# Reports
+*_REPORT.md
+*_report.md
+EXPERIMENT*.md
+MULTIDATASET*.md
+NEURO_SYMBOLIC*.md
+SYMBOLIC*.md
+ORTHOGONAL*.md
+OPEN_VOCAB*.md
+RELATIONAL*.md
+CLASS_SPECIFIC*.md
+EVIDENCE_CONSISTENCY*.md
+EXECUTABLE_LOGIC*.md
+FINAL_EXPERIMENT*.md
+MVTEC_FULL*.md
+SYMBOLICDET*.md
+V13_MVTEC*.md
+
+# Demo scripts
+demo_*.py
+
+# Training scripts
+train_*.py
+
+# Local config
+.local/
