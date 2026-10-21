@@ -18,7 +18,10 @@ if str(PROJECT) not in sys.path:
     sys.path.insert(0, str(PROJECT))
 
 from neurosymbolic_fsad.data import select_inpformer_support
-from neurosymbolic_fsad.qwen_generic_relations import QwenGenericRelationalProposer
+from neurosymbolic_fsad.qwen_generic_relations import (
+    QwenGenericRelationalProposer,
+    consensus_generic_relational_proposals,
+)
 from neurosymbolic_fsad.qwen_relations import make_rgb_support_montage
 
 
@@ -28,64 +31,15 @@ def _dump(path: Path, payload) -> None:
 
 
 def _consensus(proposer, class_name: str, support: list[Path]):
-    protocol = (
-        "four_independent_support_queries_exact_count"
-        if len(support) == 4 else
-        "independent_support_queries_exact_count"
-    )
     individual, raw_outputs = [], []
     for path in support:
         item = proposer.propose(class_name, 1, path)
         raw_outputs.append(item.pop("raw_output", ""))
         individual.append(item)
-    entities = [item.get("primary_entity") for item in individual]
-    counts = [item.get("expected_count") for item in entities if isinstance(item, dict)]
-    entity_ids = [item.get("id") for item in entities if isinstance(item, dict)]
-    arrangements = [item.get("arrangement") for item in entities if isinstance(item, dict)]
-    valid = (
-        len(counts) == len(support)
-        and len(set(counts)) == 1
-        and len(set(entity_ids)) == 1
+    proposal = consensus_generic_relational_proposals(
+        individual, minimum_fraction=0.75
     )
-    if valid:
-        predicate_sets = [
-            {row["predicate"] for row in item.get("rules", [])}
-            for item in individual
-        ]
-        shared = set.intersection(*predicate_sets) if predicate_sets else set()
-        rules = [
-            row for row in individual[0].get("rules", [])
-            if row["predicate"] in shared
-        ]
-        if not any(row["predicate"] == "count_eq" for row in rules):
-            rules.insert(0, {
-                "id": "consensus_count",
-                "predicate": "count_eq",
-                "importance": 0.9,
-                "confidence": 0.9,
-                "reason": "same within-image count in every independent support query",
-            })
-        primary = dict(entities[0])
-        primary["arrangement"] = (
-            arrangements[0] if len(set(arrangements)) == 1 else "free"
-        )
-        proposal = {
-            "normality_summary": individual[0].get("normality_summary", ""),
-            "primary_entity": primary,
-            "rules": rules,
-            "model": proposer.model_path,
-            "consensus_protocol": protocol,
-            "per_support_proposals": individual,
-        }
-    else:
-        proposal = {
-            "normality_summary": "abstained: independent support proposals disagree",
-            "primary_entity": None,
-            "rules": [],
-            "model": proposer.model_path,
-            "consensus_protocol": protocol,
-            "per_support_proposals": individual,
-        }
+    proposal["model"] = proposer.model_path
     return proposal, "\n\n===== SUPPORT QUERY =====\n\n".join(raw_outputs)
 
 

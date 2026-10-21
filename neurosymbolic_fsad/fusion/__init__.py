@@ -1,8 +1,11 @@
 """Fusion package for anomaly score fusion."""
 
-from neurosymbolic_fsad.fusion.fusion import AnomalyFusion, FusionConfig, FusionResult, AdaptiveFusion, compute_grounding_confidence
+from neurosymbolic_fsad.fusion.fusion import (
+    AnomalyFusion, FusionConfig, FusionResult, AdaptiveFusion,
+    compute_grounding_confidence, compute_logic_only_confidence
+)
 
 __all__ = [
     "AnomalyFusion", "FusionConfig", "FusionResult", "AdaptiveFusion",
-    "compute_grounding_confidence",
+    "compute_grounding_confidence", "compute_logic_only_confidence",
 ]

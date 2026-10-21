@@ -62,6 +62,56 @@ def test_qwen_not_args_spelling_is_normalized_strictly():
         normalize_normality_ast({"op": "ATOM", "name": "count", "extra": 1})
 
 
+@pytest.mark.parametrize("op", ["XOR", "IMPLIES"])
+def test_non_monotone_normality_operators_fail_closed(op):
+    candidate = {
+        "op": op,
+        "args": [
+            {"op": "ATOM", "name": "count"},
+            {"op": "ATOM", "name": "geometry"},
+        ],
+    }
+    with pytest.raises(LogicValidationError, match="positive and monotone"):
+        validate_normality_ast(candidate, ["count", "geometry"])
+    with pytest.raises(LogicValidationError, match="positive and monotone"):
+        validate_normality_ast(
+            {"op": "NOT", "arg": {"op": "ATOM", "name": "count"}},
+            ["count"],
+        )
+
+
+def test_multiple_rule_violations_cannot_cancel_anomaly():
+    normal = {
+        "op": "AND",
+        "args": [
+            {"op": "ATOM", "name": "count"},
+            {"op": "OR", "args": [
+                {"op": "ATOM", "name": "geometry"},
+                {"op": "ATOM", "name": "orientation"},
+            ]},
+        ],
+    }
+    validate_normality_ast(normal, ["count", "geometry", "orientation"])
+    values = {
+        "count": np.asarray([1.0, 0.0, 0.0]),
+        "geometry": np.asarray([1.0, 1.0, 0.0]),
+        "orientation": np.asarray([1.0, 1.0, 0.0]),
+    }
+    anomaly = evaluate_ast_matrix(anomaly_ast(normal), values)
+    assert anomaly[1] >= anomaly[0]
+    assert anomaly[2] >= anomaly[1]
+
+
+def test_counterfactuals_include_triple_violations():
+    X, y, provenance = counterfactual_search_data(
+        np.ones((2, 3)), ["a", "b", "c"], seed=3,
+        variants_per_atom=1, pair_variants=1, triple_variants=1,
+    )
+    triples = [row for row in provenance if row["kind"] == "three_atom_counterfactual"]
+    assert len(triples) == 2
+    assert X.shape[0] == len(y) == len(provenance)
+
+
 def test_support_truths_and_counterfactuals_are_support_only():
     audits = [
         {

@@ -5,7 +5,10 @@ from __future__ import annotations
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
-from neurosymbolic_fsad.perception.segmentation import ComponentInstance, extract_attributes
+from neurosymbolic_fsad.perception.segmentation import (
+    ComponentInstance as LegacyComponentInstance,
+    extract_attributes as _legacy_extract_attributes,
+)
 
 
 @dataclass
@@ -36,7 +39,7 @@ class ComponentAttributes:
     extra: Dict[str, Any] = field(default_factory=dict)
     
     @classmethod
-    def from_instance(cls, instance: ComponentInstance) -> "ComponentAttributes":
+    def from_instance(cls, instance: Any) -> "ComponentAttributes":
         """Create from ComponentInstance."""
         feat = instance.features
         return cls(
@@ -52,7 +55,9 @@ class ComponentAttributes:
             shape_solidity=feat.get("shape_solidity", 0.0),
             bbox_width=feat.get("bbox_width", 0.0),
             bbox_height=feat.get("bbox_height", 0.0),
-            dino_features=instance.dino_features,
+            dino_features=getattr(
+                instance, "dino_features", getattr(instance, "embedding", None)
+            ),
             extra={k: v for k, v in feat.items() if k not in {
                 "color_h", "color_s", "color_v", "color_h_std", "color_s_std",
                 "shape_area", "shape_perimeter", "shape_aspect", "shape_circularity",
@@ -88,13 +93,16 @@ class ComponentAttributes:
         return (aspect_diff + circ_diff + solid_diff) / 3.0
 
 
-def extract_attributes(image: np.ndarray, instance: ComponentInstance) -> Dict[str, Any]:
-    """Extract visual attributes for a component instance (re-export)."""
-    return extract_attributes(image, instance)
+def extract_attributes(image: np.ndarray, instance: Any) -> Dict[str, Any]:
+    """Compatibility adapter without the former self-recursion bug."""
+    if hasattr(instance, "attributes"):
+        from .part_attributes import part_attributes
+        return part_attributes(np.asarray(instance.mask), image)
+    return _legacy_extract_attributes(image, instance)
 
 
 def compute_attribute_statistics(
-    instances: List[ComponentInstance],
+    instances: List[Any],
 ) -> Dict[str, Dict[str, float]]:
     """Compute statistics of attributes across instances."""
     if not instances:

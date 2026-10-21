@@ -1,6 +1,9 @@
 import numpy as np
+import pytest
 
+from neurosymbolic_fsad.fuzzy_logic import LogicValidationError
 from neurosymbolic_fsad.ovd_grounder import (
+    OpenVocabularySymbolicEngine,
     _relational_signature,
     derive_prompt_candidates,
 )
@@ -57,3 +60,36 @@ def test_prompt_candidates_are_generic_and_deduplicated():
     assert candidates[0] == "pin"
     assert len(candidates) == len(set(candidates))
     assert "transistor pins" in candidates
+
+
+def test_saved_non_monotone_program_fails_closed():
+    class Detector:
+        nms_iou = 0.5
+
+    atoms = ["ovd_count_eq", "ovd_arrangement_eq"]
+    library = {
+        "grounder": {
+            "prompt": "part",
+            "threshold": 0.2,
+            "expected_count": 2,
+            "arrangement": "row",
+            "prototype": {
+                "gaps": [1.0],
+                "line_deviation": 0.0,
+                "relative_log_area": [0.0, 0.0],
+                "relative_aspect": [0.0, 0.0],
+                "absolute_center": [[0.25, 0.5], [0.75, 0.5]],
+                "absolute_size": [[0.2, 0.2], [0.2, 0.2]],
+            },
+        },
+        "rules": [{"id": name} for name in atoms],
+        "logic": {
+            "normality_ast": {
+                "op": "XOR",
+                "args": [{"op": "ATOM", "name": name} for name in atoms],
+            },
+            "anomaly_ast": {"op": "ATOM", "name": atoms[0]},
+        },
+    }
+    with pytest.raises(LogicValidationError, match="positive and monotone"):
+        OpenVocabularySymbolicEngine(library, Detector())

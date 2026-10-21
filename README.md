@@ -1,5 +1,11 @@
 # Qwen-guided relational normality rules for FSAD
 
+> **Maintained LOCO path (2026-10-20):** use
+> [`CORE_LOCO_PIPELINE.md`](CORE_LOCO_PIPELINE.md). The V2--V13 sections below
+> are historical experiment records, not cumulative modules to enable together.
+> A component enters the maintained path only after a paired ablation beats the
+> baseline/simple control without test-label model selection.
+
 This repository is an isolated neuro-symbolic layer around INP-Former.  It does
 not modify the baseline repository.  Local
 `/home/hjh/AgentModels/Qwen3-VL-8B-Thinking` is used once, offline, to induce a
@@ -7,6 +13,10 @@ normal scene program from few-shot normal images.  Test-time inference loads
 only the compiled JSON rule library and deterministic visual grounder.
 
 ## V11 category-agnostic orthogonal feature fusion
+
+Historical only: its non-monotone `NOT/IMPLIES/XOR` normality search has been
+invalidated because simultaneous violations can cancel. The maintained search
+accepts positive `AND/OR` normality trees only.
 
 The newest research entry point is `run_generic_orthogonal_fsad.py`. It has no
 category-specific algorithm branches. Qwen supplies a semantic entity seed;

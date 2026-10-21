@@ -1,31 +1,34 @@
-"""Rule-to-Pixel Grounding module for spatial anomaly attribution."""
+"""Rule-to-Pixel Grounding for SymbolicAD.
+
+This module provides spatial attribution for rule violations with proper
+instance-level, slot-level, and relation-level grounding strategies.
+"""
 
 from __future__ import annotations
 
 import cv2
 import numpy as np
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
-from ..rules.generation.dsl import NormalityRule, RuleType
-from ..perception.scene_graph import SceneGraph
-from ..perception.segmentation import ComponentInstance
-from ..reasoning.executor import ViolationEvidence
+from neurosymbolic_fsad.rules.generation.dsl import NormalityRule, RuleType
+from neurosymbolic_fsad.perception.scene_graph import SceneGraph
+from neurosymbolic_fsad.reasoning.violation_result import ViolationResult, RuleStatus
 
 
 @dataclass
 class GroundingResult:
     """Result of grounding a rule violation to pixel space."""
     rule_id: str
-    anomaly_map: np.ndarray  # [H, W] in [0, 1]
-    responsibility_map: np.ndarray  # [H, W] component responsibility
-    uncertainty_map: np.ndarray  # [H, W] grounding uncertainty
+    anomaly_map: np.ndarray          # [H, W] anomaly score map
+    responsibility_map: np.ndarray   # [H, W] component responsibility
+    uncertainty_map: np.ndarray      # [H, W] grounding uncertainty
+    strategy: str                    # grounding strategy used
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 class RuleToPixelGrounder:
-    """Ground rule violations to pixel-level anomaly maps."""
+    """Ground rule violations to pixel space with proper attribution."""
     
     def __init__(
         self,
@@ -37,111 +40,113 @@ class RuleToPixelGrounder:
     
     def ground_violation(
         self,
-        evidence: ViolationEvidence,
+        violation: ViolationResult,
         graph: SceneGraph,
         normal_slots: Dict[int, Dict[str, Any]],
     ) -> GroundingResult:
-        """Ground a violation evidence to pixel space."""
-        rule_type = evidence.rule_type
+        """Ground a violation to pixel space based on its type."""
+        rule_id = violation.rule_id
+        strategy = violation.grounding_strategy
         
-        if rule_type == RuleType.COUNT:
-            return self._ground_count_violation(evidence, graph, normal_slots)
-        elif rule_type == RuleType.ATTRIBUTE:
-            return self._ground_attribute_violation(evidence, graph)
-        elif rule_type == RuleType.SPATIAL:
-            return self._ground_spatial_violation(evidence, graph)
-        elif rule_type == RuleType.TOPOLOGICAL:
-            return self._ground_topological_violation(evidence, graph)
-        elif rule_type == RuleType.COMPOSITION:
-            return self._ground_composition_violation(evidence, graph)
+        # Get rule details from violation
+        details = violation.details
+        
+        if "COUNT" in details.get("attribute", "").upper() or "COUNT" in details.get("predicate_name", "").upper():
+            return self._ground_count(violation, graph, normal_slots)
+        elif "SPATIAL" in details.get("predicate_name", "").upper() or "SPATIAL" in details.get("attribute", "").upper():
+            return self._ground_spatial(violation, graph, normal_slots)
+        elif "ATTRIBUTE" in details.get("predicate_name", "").upper() or any(attr in details.get("predicate_name", "").upper() 
+            for attr in ["LENGTH", "WIDTH", "HEIGHT", "AREA", "ASPECT_RATIO", "COLOR", "CIRCULARITY", "SOLIDITY"]):
+            return self._ground_attribute(violation, graph, normal_slots)
+        elif "TOPOLOGICAL" in details.get("predicate_name", "").upper() or any(topo in details.get("predicate_name", "").upper() 
+            for topo in ["CONNECTED", "TOUCHING", "CONTAINS", "INSIDE", "DISJOINT", "OVERLAPS"]):
+            return self._ground_topological(violation, graph, normal_slots)
+        elif "COMPOSITION" in details.get("predicate_name", "").upper() or "REQUIRES" in details.get("predicate_name", "").upper() or "FORBIDS" in details.get("predicate_name", "").upper():
+            return self._ground_composition(violation, graph, normal_slots)
         
         # Default: use witness map if available
-        if evidence.witness_map is not None:
-            anomaly_map = cv2.GaussianBlur(
-                evidence.witness_map, (0, 0), self.blur_sigma
-            )
+        if violation.anomaly_map is not None:
+            anomaly_map = cv2.GaussianBlur(violation.anomaly_map, (0, 0), self.blur_sigma)
             return GroundingResult(
-                rule_id=evidence.rule_id,
+                rule_id=violation.rule_id,
                 anomaly_map=np.clip(anomaly_map, 0, 1),
                 responsibility_map=anomaly_map,
                 uncertainty_map=np.ones_like(anomaly_map) * 0.5,
+                strategy="witness_map",
+                metadata=violation.details,
             )
         
         return GroundingResult(
-            rule_id=evidence.rule_id,
+            rule_id=violation.rule_id,
             anomaly_map=np.zeros((self.map_size, self.map_size)),
             responsibility_map=np.zeros((self.map_size, self.map_size)),
             uncertainty_map=np.ones((self.map_size, self.map_size)),
+            strategy="none",
+            metadata={},
         )
     
-    def _ground_count_violation(
-        self,
-        evidence: ViolationEvidence,
-        graph: SceneGraph,
-        normal_slots: Dict[int, Dict[str, Any]],
-    ) -> GroundingResult:
+    def _ground_count(self, violation, graph, normal_slots) -> GroundingResult:
         """Ground count violation (missing or extra objects)."""
         anomaly_map = np.zeros((self.map_size, self.map_size), dtype=np.float32)
         responsibility = np.zeros((self.map_size, self.map_size), dtype=np.float32)
         uncertainty = np.ones((self.map_size, self.map_size), dtype=np.float32) * 0.3
         
-        expected = evidence.expected
-        actual = evidence.actual
-        target_type = evidence.details.get("target_type", "")
+        expected = violation.details.get("expected", 0)
+        actual = violation.details.get("actual", 0)
+        target_type = violation.details.get("target_type", "")
         
         if actual > expected:
-            # Extra objects - mark them
-            for comp_id in evidence.component_ids:
+            # Extra objects - highlight them
+            for comp_id in violation.witness_instances:
                 if comp_id < len(graph.components):
                     comp = graph.components[comp_id]
-                    mask = self._resize_mask(comp.mask)
-                    anomaly_map = np.maximum(anomaly_map, mask * evidence.violation_score)
+                    mask = cv2.resize(
+                        comp.mask.astype(np.float32),
+                        (self.map_size, self.map_size),
+                    )
+                    anomaly_map = np.maximum(anomaly_map, mask * violation.violation_score)
                     responsibility = np.maximum(responsibility, mask)
-                    uncertainty[mask > 0] = 0.1  # High certainty for visible objects
+                    uncertainty[mask > 0] = 0.1
         
         elif actual < expected and normal_slots:
-            # Missing objects - mark expected slots
+            # Missing objects - highlight expected slots
             missing_count = expected - actual
             for slot_id, slot_info in normal_slots.items():
                 if slot_info.get("reference_type") == target_type and missing_count > 0:
                     cx, cy = slot_info["mean_position"]
                     x, y = int(cx * self.map_size), int(cy * self.map_size)
                     r = max(10, int(0.05 * self.map_size))
-                    cv2.circle(anomaly_map, (x, y), r, evidence.violation_score, -1)
+                    cv2.circle(anomaly_map, (x, y), r, violation.violation_score, -1)
                     cv2.circle(responsibility, (x, y), r, 0.5, -1)
-                    uncertainty[y-r:y+r, x-r:x+r] = 0.4  # Medium uncertainty
+                    uncertainty[y-r:y+r, x-r:x+r] = 0.4
                     missing_count -= 1
         
         anomaly_map = cv2.GaussianBlur(anomaly_map, (0, 0), self.blur_sigma)
         responsibility = cv2.GaussianBlur(responsibility, (0, 0), self.blur_sigma)
         
         return GroundingResult(
-            rule_id=evidence.rule_id,
+            rule_id=violation.rule_id,
             anomaly_map=np.clip(anomaly_map, 0, 1),
             responsibility_map=np.clip(responsibility, 0, 1),
             uncertainty_map=np.clip(uncertainty, 0, 1),
-            metadata={"type": "count", "expected": expected, "actual": actual},
+            strategy="count",
+            metadata={"expected": expected, "actual": actual, "target_type": target_type},
         )
     
-    def _ground_attribute_violation(
-        self,
-        evidence: ViolationEvidence,
-        graph: SceneGraph,
-    ) -> GroundingResult:
+    def _ground_attribute(self, violation, graph, normal_slots) -> GroundingResult:
         """Ground attribute violation (color, shape, size)."""
         anomaly_map = np.zeros((self.map_size, self.map_size), dtype=np.float32)
         responsibility = np.zeros((self.map_size, self.map_size), dtype=np.float32)
         uncertainty = np.ones((self.map_size, self.map_size), dtype=np.float32) * 0.2
         
-        for comp_id in evidence.component_ids:
+        for comp_id in violation.witness_instances:
             if comp_id < len(graph.components):
                 comp = graph.components[comp_id]
-                mask = self._resize_mask(comp.mask)
+                mask = cv2.resize(comp.mask.astype(np.float32), (self.map_size, self.map_size))
                 
-                # Weight by attribute deviation
-                attr_name = evidence.details.get("attribute", "")
-                attr_val = comp.features.get(attr_name, 0)
-                expected = evidence.expected or 0
+                attr_name = violation.details.get("attribute", "")
+                attr_val = comp.features.get(attr_name.lower(), 0)
+                expected = violation.details.get("expected", 0)
                 weight = min(1.0, abs(attr_val - expected) / max(abs(expected), 1e-6))
                 
                 anomaly_map = np.maximum(anomaly_map, mask * weight)
@@ -152,67 +157,61 @@ class RuleToPixelGrounder:
         responsibility = cv2.GaussianBlur(responsibility, (0, 0), self.blur_sigma)
         
         return GroundingResult(
-            rule_id=evidence.rule_id,
+            rule_id=violation.rule_id,
             anomaly_map=np.clip(anomaly_map, 0, 1),
             responsibility_map=np.clip(responsibility, 0, 1),
             uncertainty_map=np.clip(uncertainty, 0, 1),
-            metadata={"type": "attribute", "attribute": evidence.details.get("attribute")},
+            strategy="attribute",
+            metadata={"attribute": violation.details.get("attribute", "")},
         )
     
-    def _ground_spatial_violation(
-        self,
-        evidence: ViolationEvidence,
-        graph: SceneGraph,
-    ) -> GroundingResult:
+    def _ground_spatial(self, violation, graph, normal_slots) -> GroundingResult:
         """Ground spatial relation violation."""
         anomaly_map = np.zeros((self.map_size, self.map_size), dtype=np.float32)
         responsibility = np.zeros((self.map_size, self.map_size), dtype=np.float32)
         uncertainty = np.ones((self.map_size, self.map_size), dtype=np.float32) * 0.3
         
-        if len(evidence.component_ids) >= 2:
-            src_id, tgt_id = evidence.component_ids[0], evidence.component_ids[1]
+        if len(violation.witness_instances) >= 2:
+            src_id, tgt_id = violation.witness_instances[0], violation.witness_instances[1]
             
             for comp_id in [src_id, tgt_id]:
                 if comp_id < len(graph.components):
                     comp = graph.components[comp_id]
-                    mask = self._resize_mask(comp.mask)
-                    anomaly_map = np.maximum(anomaly_map, mask * evidence.violation_score)
+                    mask = cv2.resize(comp.mask.astype(np.float32), (self.map_size, self.map_size))
+                    anomaly_map = np.maximum(anomaly_map, mask * violation.violation_score)
                     responsibility = np.maximum(responsibility, mask)
                     uncertainty[mask > 0] = 0.2
             
-            # Draw connection line showing expected vs actual
+            # Draw arrow between them
             src = graph.components[src_id]
             tgt = graph.components[tgt_id]
             x1, y1 = int(src.centroid[0] * self.map_size), int(src.centroid[1] * self.map_size)
             x2, y2 = int(tgt.centroid[0] * self.map_size), int(tgt.centroid[1] * self.map_size)
-            cv2.line(anomaly_map, (x1, y1), (x2, y2), evidence.violation_score * 0.5, 2)
+            cv2.arrowedLine(anomaly_map, (x1, y1), (x2, y2), violation.violation_score * 0.5, 2, tipLength=0.1)
         
         anomaly_map = cv2.GaussianBlur(anomaly_map, (0, 0), self.blur_sigma)
         responsibility = cv2.GaussianBlur(responsibility, (0, 0), self.blur_sigma)
         
         return GroundingResult(
-            rule_id=evidence.rule_id,
+            rule_id=violation.rule_id,
             anomaly_map=np.clip(anomaly_map, 0, 1),
             responsibility_map=np.clip(responsibility, 0, 1),
             uncertainty_map=np.clip(uncertainty, 0, 1),
-            metadata={"type": "spatial", "relation": evidence.expected},
+            strategy="spatial",
+            metadata={"relation": violation.details.get("relation", "")},
         )
     
-    def _ground_topological_violation(
-        self,
-        evidence: ViolationEvidence,
-        graph: SceneGraph,
-    ) -> GroundingResult:
+    def _ground_topological(self, violation, graph, normal_slots) -> GroundingResult:
         """Ground topological relation violation."""
         anomaly_map = np.zeros((self.map_size, self.map_size), dtype=np.float32)
         responsibility = np.zeros((self.map_size, self.map_size), dtype=np.float32)
         uncertainty = np.ones((self.map_size, self.map_size), dtype=np.float32) * 0.3
         
-        for comp_id in evidence.component_ids:
+        for comp_id in violation.witness_instances:
             if comp_id < len(graph.components):
                 comp = graph.components[comp_id]
-                mask = self._resize_mask(comp.mask)
-                anomaly_map = np.maximum(anomaly_map, mask * evidence.violation_score)
+                mask = cv2.resize(comp.mask.astype(np.float32), (self.map_size, self.map_size))
+                anomaly_map = np.maximum(anomaly_map, mask * violation.violation_score)
                 responsibility = np.maximum(responsibility, mask)
                 uncertainty[mask > 0] = 0.2
         
@@ -220,66 +219,56 @@ class RuleToPixelGrounder:
         responsibility = cv2.GaussianBlur(responsibility, (0, 0), self.blur_sigma)
         
         return GroundingResult(
-            rule_id=evidence.rule_id,
+            rule_id=violation.rule_id,
             anomaly_map=np.clip(anomaly_map, 0, 1),
             responsibility_map=np.clip(responsibility, 0, 1),
             uncertainty_map=np.clip(uncertainty, 0, 1),
-            metadata={"type": "topological", "relation": evidence.expected},
+            strategy="topological",
+            metadata={"relation": violation.details.get("relation", "")},
         )
     
-    def _ground_composition_violation(
-        self,
-        evidence: ViolationEvidence,
-        graph: SceneGraph,
-    ) -> GroundingResult:
+    def _ground_composition(self, violation, graph, normal_slots) -> GroundingResult:
         """Ground composition violation."""
         anomaly_map = np.zeros((self.map_size, self.map_size), dtype=np.float32)
         responsibility = np.zeros((self.map_size, self.map_size), dtype=np.float32)
         uncertainty = np.ones((self.map_size, self.map_size), dtype=np.float32) * 0.4
         
-        details = evidence.details
+        details = violation.details
         
         # Missing required components
         for missing_type in details.get("missing_required", []):
-            for comp in graph.components:
-                if graph.component_types.get(id(comp), "") == missing_type:
-                    mask = self._resize_mask(comp.mask)
-                    anomaly_map = np.maximum(anomaly_map, mask * evidence.violation_score)
-                    responsibility = np.maximum(responsibility, mask)
+            for slot_id, slot_info in normal_slots.items():
+                if slot_info.get("reference_type") == missing_type:
+                    cx, cy = slot_info["mean_position"]
+                    x, y = int(cx * self.map_size), int(cy * self.map_size)
+                    r = max(10, int(0.05 * self.map_size))
+                    cv2.circle(anomaly_map, (x, y), r, violation.violation_score, -1)
+                    cv2.circle(responsibility, (x, y), r, 0.5, -1)
         
         # Forbidden combinations
         for forbidden in details.get("forbidden_violated", []):
-            for comp in graph.components:
-                comp_type = graph.component_types.get(id(comp), "")
-                if comp_type in forbidden:
-                    mask = self._resize_mask(comp.mask)
-                    anomaly_map = np.maximum(anomaly_map, mask * evidence.violation_score * 0.7)
-                    responsibility = np.maximum(responsibility, mask * 0.5)
+            for comp_type in forbidden:
+                for comp in graph.components:
+                    if graph.component_types.get(id(comp), "") == comp_type:
+                        mask = cv2.resize(comp.mask.astype(np.float32), (self.map_size, self.map_size))
+                        anomaly_map = np.maximum(anomaly_map, mask * violation.violation_score * 0.7)
+                        responsibility = np.maximum(responsibility, mask * 0.5)
         
         anomaly_map = cv2.GaussianBlur(anomaly_map, (0, 0), self.blur_sigma)
         responsibility = cv2.GaussianBlur(responsibility, (0, 0), self.blur_sigma)
         
         return GroundingResult(
-            rule_id=evidence.rule_id,
+            rule_id=violation.rule_id,
             anomaly_map=np.clip(anomaly_map, 0, 1),
             responsibility_map=np.clip(responsibility, 0, 1),
             uncertainty_map=np.clip(uncertainty, 0, 1),
-            metadata={"type": "composition", "details": details},
-        )
-    
-    def _resize_mask(self, mask: np.ndarray) -> np.ndarray:
-        """Resize mask to map_size."""
-        if mask.shape[:2] == (self.map_size, self.map_size):
-            return mask.astype(np.float32)
-        return cv2.resize(
-            mask.astype(np.float32),
-            (self.map_size, self.map_size),
-            interpolation=cv2.INTER_LINEAR,
+            strategy="composition",
+            metadata={"details": details},
         )
 
 
 class GroundingFusion:
-    """Fuse multiple grounding results into a unified logic anomaly map."""
+    """Fuse multiple grounding results into unified logic anomaly map."""
     
     def __init__(
         self,
@@ -301,7 +290,6 @@ class GroundingFusion:
                 {},
             )
         
-        # Collect anomaly maps
         maps = []
         weights = []
         
@@ -325,16 +313,14 @@ class GroundingFusion:
         elif self.fusion_method == "weighted_mean":
             fused = np.sum(maps * weights[:, None, None], axis=0) / np.sum(weights)
         elif self.fusion_method == "probabilistic_or":
-            # Probabilistic OR: 1 - prod(1 - p_i)
             fused = 1.0 - np.prod(1.0 - maps, axis=0)
         else:
             fused = np.max(maps, axis=0)
         
-        # Per-rule contribution maps
+        # Per-rule contributions
         contributions = {}
         for i, result in enumerate(grounding_results):
             if self.fusion_method in ["max", "weighted_max"]:
-                # Contribution where this rule is the maximum
                 max_map = np.max(maps, axis=0)
                 contributions[result.rule_id] = np.where(
                     np.abs(result.anomaly_map - max_map) < 1e-6,
@@ -347,7 +333,7 @@ class GroundingFusion:
 
 
 def create_logic_anomaly_map(
-    execution_result: Any,  # RuleExecutionResult
+    execution_result: Any,
     graph: SceneGraph,
     normal_slots: Dict[int, Dict[str, Any]],
     grounder: RuleToPixelGrounder,
@@ -357,10 +343,27 @@ def create_logic_anomaly_map(
     """Create unified logic anomaly map from rule execution results."""
     grounding_results = []
     
-    for evidence in execution_result.violations:
-        result = grounder.ground_violation(evidence, graph, normal_slots)
-        grounding_results.append(result)
+    for violation in execution_result.rule_results:
+        if violation.violation_score > 1e-6:
+            result = grounder.ground_violation(violation, graph, normal_slots)
+            grounding_results.append(result)
     
     fused_map, contributions = fusion.fuse(grounding_results, rule_weights)
     
     return fused_map, contributions
+
+
+def compute_grounding_confidence(
+    logic_map: np.ndarray,
+    visual_map: np.ndarray,
+    threshold: float = 0.1,
+) -> np.ndarray:
+    """Compute grounding confidence map.
+    
+    High confidence where both logic and visual anomalies agree.
+    Low confidence where logic fires but visual doesn't.
+    """
+    visual_evidence = np.clip(visual_map / (threshold + 1e-6), 0, 1)
+    logic_strength = logic_map
+    confidence = 0.5 + 0.5 * visual_evidence * logic_strength
+    return confidence

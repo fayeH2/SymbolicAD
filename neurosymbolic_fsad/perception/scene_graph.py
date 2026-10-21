@@ -30,13 +30,31 @@ class TopologicalRelation:
 
 
 @dataclass
+class RelationEdge:
+    """Independent continuous relation channels; never a compound label."""
+    source_id: int
+    target_id: int
+    dx: float
+    dy: float
+    distance: float
+    angle: float
+    horizontal_alignment: float
+    vertical_alignment: float
+    intersection_over_union: float
+
+
+@dataclass
 class SceneGraph:
     """Scene graph representing components and their relations."""
     components: List[Any]  # ComponentInstance objects
     spatial_relations: List[SpatialRelation] = field(default_factory=list)
     topological_relations: List[TopologicalRelation] = field(default_factory=list)
+    relation_edges: List[RelationEdge] = field(default_factory=list)
     component_types: Dict[int, str] = field(default_factory=dict)
     global_context: Dict[str, Any] = field(default_factory=dict)
+    grounding_confidence: float = 1.0
+    observation_complete: bool = True
+    slot_probability_maps: Dict[str, np.ndarray] = field(default_factory=dict)
     
     def get_component(self, idx: int) -> Optional[Any]:
         """Get component by index."""
@@ -51,6 +69,25 @@ class SceneGraph:
     def get_topological_relations(self, source_id: int) -> List[TopologicalRelation]:
         """Get all topological relations from a source component."""
         return [r for r in self.topological_relations if r.source_id == source_id]
+
+    def component_type(self, index: int) -> str:
+        component = self.get_component(index)
+        if component is None:
+            return ""
+        return str(
+            self.component_types.get(
+                index,
+                self.component_types.get(
+                    id(component), getattr(component, "entity_type", "")
+                ),
+            )
+        )
+
+    def instances_of(self, entity_type: str) -> List[Any]:
+        return [
+            component for index, component in enumerate(self.components)
+            if self.component_type(index) == entity_type
+        ]
     
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to dictionary."""
@@ -77,8 +114,22 @@ class SceneGraph:
                 }
                 for r in self.topological_relations
             ],
+            "relation_edges": [
+                {
+                    "source": row.source_id, "target": row.target_id,
+                    "dx": row.dx, "dy": row.dy, "distance": row.distance,
+                    "angle": row.angle,
+                    "horizontal_alignment": row.horizontal_alignment,
+                    "vertical_alignment": row.vertical_alignment,
+                    "intersection_over_union": row.intersection_over_union,
+                }
+                for row in self.relation_edges
+            ],
             "component_types": self.component_types,
             "global_context": self.global_context,
+            "grounding_confidence": self.grounding_confidence,
+            "observation_complete": self.observation_complete,
+            "slot_probability_maps": sorted(self.slot_probability_maps),
         }
 
 
@@ -114,9 +165,6 @@ def build_scene_graph(
             distance = math.sqrt(dx*dx + dy*dy)
             angle = math.atan2(dy, dx)  # -pi to pi
             
-            if distance > spatial_threshold:
-                continue
-            
             # Determine relation type
             abs_dx, abs_dy = abs(dx), abs(dy)
             if abs_dx > abs_dy:
@@ -124,14 +172,8 @@ def build_scene_graph(
             else:
                 rel_type = "below" if dy > 0 else "above"
             
-            # Near/far classification
-            if distance < 0.1:
-                rel_type = "near_" + rel_type
-            elif distance > 0.2:
-                rel_type = "far_" + rel_type
-            
             # Confidence based on distance
-            score = max(0.0, 1.0 - distance / spatial_threshold)
+            score = max(0.0, 1.0 - distance / max(spatial_threshold, 1e-8))
             
             graph.spatial_relations.append(SpatialRelation(
                 source_id=i, target_id=j,
@@ -150,6 +192,18 @@ def build_scene_graph(
             intersection = np.logical_and(mask_i, mask_j).sum()
             union = np.logical_or(mask_i, mask_j).sum()
             iou = intersection / union if union > 0 else 0.0
+
+            cx_i, cy_i = components[i].centroid
+            cx_j, cy_j = components[j].centroid
+            dx, dy = cx_j - cx_i, cy_j - cy_i
+            graph.relation_edges.append(RelationEdge(
+                source_id=i, target_id=j, dx=float(dx), dy=float(dy),
+                distance=float(math.hypot(dx, dy)),
+                angle=float(math.atan2(dy, dx)),
+                horizontal_alignment=float(1.0 - min(abs(dy), 1.0)),
+                vertical_alignment=float(1.0 - min(abs(dx), 1.0)),
+                intersection_over_union=float(iou),
+            ))
             
             if iou > topological_threshold:
                 # Check containment

@@ -1,4 +1,12 @@
-"""Rule search and optimization using NSGA-II multi-objective evolution."""
+"""Validation-Driven Rule Search for SymbolicAD.
+
+This replaces the NSGA-II search with a validation-driven approach:
+1. Rules are validated on normal supports first (must hold)
+2. Counterfactual anomalies are generated to test discriminative power
+3. Rule dependencies are tracked to avoid redundancy
+4. Greedy coverage selection with dependency awareness
+5. No artificial rewards - only real validation metrics
+"""
 
 from __future__ import annotations
 
@@ -6,7 +14,7 @@ import copy
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Set
 import numpy as np
 
 from neurosymbolic_fsad.rules.generation.dsl import NormalityRule, RuleSet, RuleType
@@ -16,349 +24,345 @@ from neurosymbolic_fsad.perception.prototypes import SemanticPrototypeBank
 
 @dataclass
 class RuleCandidate:
-    """A candidate rule in the evolutionary population."""
+    """A candidate rule in the search population."""
     rule: NormalityRule
-    fitness: Dict[str, float] = field(default_factory=dict)
+    # Validation metrics on normal supports
+    support_hold_rate: float = 0.0
+    # Discriminative power on counterfactual anomalies
+    anomaly_detection_auroc: float = 0.5
+    anomaly_detection_aupr: float = 0.5
+    # Dependency analysis
+    depends_on: Set[str] = field(default_factory=set)
+    implied_by: Set[str] = field(default_factory=set)
+    # Redundancy with other rules
+    redundancy_score: float = 0.0
+    # Overall fitness
+    fitness: float = 0.0
     generation: int = 0
     parent_ids: Tuple[str, ...] = ()
-    _uid: int = field(default_factory=lambda: random.randint(0, 2**31-1))
     
-    def __hash__(self):
-        return hash(self._uid)
-    
-    def __eq__(self, other):
-        if not isinstance(other, RuleCandidate):
-            return False
-        return self._uid == other._uid
-    
-    def dominates(self, other: "RuleCandidate") -> bool:
-        """Check if this candidate dominates another (Pareto dominance)."""
-        better_in_any = False
-        for key in self.fitness:
-            if key not in other.fitness:
-                continue
-            if self.fitness[key] < other.fitness[key]:  # Minimization
-                return False
-            if self.fitness[key] > other.fitness[key]:
-                better_in_any = True
-        return better_in_any
+    def __lt__(self, other: "RuleCandidate") -> bool:
+        return self.fitness < other.fitness
 
 
 @dataclass
 class SearchConfig:
-    """Configuration for NSGA-II rule search."""
-    population_size: int = 100
-    max_generations: int = 50
-    tournament_size: int = 3
-    crossover_rate: float = 0.7
+    """Configuration for rule search."""
+    max_candidates: int = 100
+    max_iterations: int = 20
+    min_support_hold_rate: float = 0.9  # Must hold on 90% of normal supports
+    min_anomaly_auroc: float = 0.6      # Must discriminate anomalies
+    max_redundancy: float = 0.7         # Max correlation with existing rules
     mutation_rate: float = 0.3
-    elite_size: int = 10
+    crossover_rate: float = 0.5
+    elite_size: int = 5
     random_seed: int = 42
     
-    # Objective weights (for scalarization if needed)
-    obj_weights: Dict[str, float] = field(default_factory=lambda: {
-        "support_consistency": 1.0,
-        "semantic_coverage": 1.0,
-        "complementarity": 1.0,
-        "redundancy": -1.0,  # Minimize
-        "reliability": 1.0,
-        "spatial_groundability": 1.0,
-        "complexity": -0.5,  # Minimize
-    })
+    # Weights for fitness computation
+    w_support: float = 0.4
+    w_anomaly: float = 0.4
+    w_novelty: float = 0.2
 
 
-class RuleSearchEvaluator:
-    """Evaluate rule candidates on multiple objectives."""
+class RuleValidator:
+    """Validates rules on normal supports and counterfactual anomalies."""
     
     def __init__(
         self,
         support_graphs: List[SceneGraph],
-        prototype_bank: SemanticPrototypeBank,
         normal_masks: List[np.ndarray],
-        config: SearchConfig,
+        anomaly_graphs: List[SceneGraph],
+        anomaly_masks: List[np.ndarray],
+        executor: 'RuleExecutor',
+        prototype_bank: SemanticPrototypeBank,
     ):
         self.support_graphs = support_graphs
-        self.prototype_bank = prototype_bank
         self.normal_masks = normal_masks
-        self.config = config
-        self.rng = np.random.RandomState(config.random_seed)
+        self.anomaly_graphs = anomaly_graphs
+        self.anomaly_masks = anomaly_masks
+        self.executor = executor
+        self.prototype_bank = prototype_bank
+        self.rng = np.random.RandomState(42)
     
-    def evaluate(self, candidate: RuleCandidate) -> Dict[str, float]:
-        """Evaluate a rule candidate on all objectives."""
-        rule = candidate.rule
-        fitness = {}
+    def validate_on_supports(self, rule: NormalityRule) -> float:
+        """Check if rule holds on normal supports.
         
-        # 1. Support consistency: how well rule holds on normal supports
-        fitness["support_consistency"] = self._eval_support_consistency(rule)
-        
-        # 2. Semantic coverage: does rule cover a new semantic dimension
-        fitness["semantic_coverage"] = self._eval_semantic_coverage(rule)
-        
-        # 3. Complementarity: does rule detect different anomalies than existing
-        fitness["complementarity"] = self._eval_complementarity(rule)
-        
-        # 4. Redundancy: overlap with existing rules (minimize)
-        fitness["redundancy"] = self._eval_redundancy(rule)
-        
-        # 5. Reliability: consistency of rule evaluation
-        fitness["reliability"] = self._eval_reliability(rule)
-        
-        # 6. Spatial groundability: can we produce a spatial anomaly map
-        fitness["spatial_groundability"] = self._eval_spatial_groundability(rule)
-        
-        # 7. Complexity: rule complexity (minimize)
-        fitness["complexity"] = self._eval_complexity(rule)
-        
-        candidate.fitness = fitness
-        return fitness
-    
-    def _eval_support_consistency(self, rule: NormalityRule) -> float:
-        """Evaluate how consistently rule holds on normal supports."""
+        Returns hold rate in [0, 1].
+        """
         if not self.support_graphs:
             return 0.5
         
         hold_count = 0
-        total = 0
-        
         for graph in self.support_graphs:
-            if self._check_rule_on_graph(rule, graph):
+            result = self.executor.execute(graph)
+            rule_result = next((r for r in result.rule_results if r.rule_id == rule.rule_id), None)
+            if rule_result and rule_result.status.name == "SATISFIED":
                 hold_count += 1
-            total += 1
-        
-        return hold_count / total if total > 0 else 0.5
+        return hold_count / len(self.support_graphs)
     
-    def _check_rule_on_graph(self, rule: NormalityRule, graph: SceneGraph) -> bool:
-        """Check if a rule holds on a scene graph."""
-        if rule.rule_type == RuleType.COUNT:
-            target_type = rule.part_type
-            count = sum(1 for c in graph.components 
-                       if graph.component_types.get(id(c), "") == target_type)
-            expected = rule.expected_count or 0
-            return abs(count - expected) <= rule.count_tolerance
+    def validate_on_anomalies(self, rule: NormalityRule) -> Tuple[float, float]:
+        """Test discriminative power on anomaly graphs.
         
-        elif rule.rule_type == RuleType.ATTRIBUTE:
-            # Check attribute constraint on relevant components
-            target_type = rule.part_type
-            for comp in graph.components:
-                if graph.component_types.get(id(comp), "") == target_type:
-                    attr_val = self._get_attribute(comp, rule.attribute)
-                    if attr_val is not None:
-                        expected = rule.expected_value or 0
-                        tol = rule.tolerance or 0.1
-                        if rule.direction == "stable":
-                            if abs(attr_val - expected) > tol:
-                                return False
-                        elif rule.direction == "low":
-                            if attr_val > expected + tol:
-                                return False
-                        elif rule.direction == "high":
-                            if attr_val < expected - tol:
-                                return False
-            return True
+        Returns (AUROC, AUPR) on anomaly set.
+        """
+        if not self.anomaly_graphs:
+            return 0.5, 0.5
         
-        elif rule.rule_type == RuleType.SPATIAL:
-            # Check spatial relation
-            return self._check_spatial_relation(rule, graph)
+        labels = []
+        scores = []
         
-        elif rule.rule_type == RuleType.TOPOLOGICAL:
-            return self._check_topological_relation(rule, graph)
+        for graph, mask in zip(self.anomaly_graphs, self.anomaly_masks):
+            result = self.executor.execute(graph)
+            rule_result = next((r for r in result.rule_results if r.rule_id == rule.rule_id), None)
+            if rule_result:
+                scores.append(rule_result.violation_score)
+                labels.append(1 if mask.any() else 0)
         
-        elif rule.rule_type == RuleType.COMPOSITION:
-            return self._check_composition(rule, graph)
+        if not scores or len(set(labels)) < 2:
+            return 0.5, 0.5
         
-        return True
+        from sklearn.metrics import roc_auc_score, average_precision_score
+        try:
+            auroc = roc_auc_score(labels, scores)
+            aupr = average_precision_score(labels, scores)
+            return float(auroc), float(aupr)
+        except:
+            return 0.5, 0.5
     
-    def _get_attribute(self, comp: Any, attr_type: Optional[AttributeType]) -> Optional[float]:
-        """Get attribute value from component."""
-        if attr_type is None or not hasattr(comp, 'features'):
-            return None
-        return comp.features.get(attr_type.value)
+    def check_dependencies(self, rule: NormalityRule, existing_rules: List[NormalityRule]) -> Tuple[Set[str], Set[str]]:
+        """Check logical dependencies with existing rules.
+        
+        Returns (depends_on, implied_by).
+        """
+        depends_on = set()
+        implied_by = set()
+        
+        for existing in existing_rules:
+            if self._implies(rule, existing):
+                depends_on.add(existing.rule_id)
+            if self._implies(existing, rule):
+                implied_by.add(existing.rule_id)
+        
+        return depends_on, implied_by
     
-    def _check_spatial_relation(self, rule: NormalityRule, graph: SceneGraph) -> bool:
-        """Check spatial relation rule."""
-        if not rule.spatial_relation or not rule.part_type or not rule.target_part_type:
-            return True
+    def _implies(self, rule_a: NormalityRule, rule_b: NormalityRule) -> bool:
+        """Check if rule_a logically implies rule_b.
         
-        source_comps = [c for c in graph.components 
-                       if graph.component_types.get(id(c), "") == rule.part_type]
-        target_comps = [c for c in graph.components 
-                       if graph.component_types.get(id(c), "") == rule.target_part_type]
-        
-        if not source_comps or not target_comps:
-            return True  # Vacuously true if components missing
-        
-        # Check if relation holds for at least one pair
-        for src in source_comps:
-            for tgt in target_comps:
-                if self._check_spatial_pair(src, tgt, rule.spatial_relation, rule.spatial_threshold):
-                    return True
-        return False
-    
-    def _check_spatial_pair(
-        self, src: Any, tgt: Any, rel: Any, threshold: float
-    ) -> bool:
-        """Check spatial relation between two components."""
-        cx1, cy1 = src.centroid
-        cx2, cy2 = tgt.centroid
-        dx = cx2 - cx1
-        dy = cy2 - cy1
-        dist = np.sqrt(dx*dx + dy*dy)
-        
-        if dist > threshold:
+        Simple heuristic: same predicate, tighter bounds.
+        """
+        if rule_a.predicate_name != rule_b.predicate_name:
             return False
         
-        if rel == SpatialRelationType.LEFT_OF:
-            return dx < -0.02
-        elif rel == SpatialRelationType.RIGHT_OF:
-            return dx > 0.02
-        elif rel == SpatialRelationType.ABOVE:
-            return dy < -0.02
-        elif rel == SpatialRelationType.BELOW:
-            return dy > 0.02
-        elif rel == SpatialRelationType.NEAR:
-            return dist < threshold
-        elif rel == SpatialRelationType.ALIGNED_HORIZONTAL:
-            return abs(dy) < 0.03
-        elif rel == SpatialRelationType.ALIGNED_VERTICAL:
-            return abs(dx) < 0.03
-        return True
-    
-    def _check_topological_relation(self, rule: NormalityRule, graph: SceneGraph) -> bool:
-        """Check topological relation rule."""
-        if not rule.topological_relation:
-            return True
+        if rule_a.rule_type == RuleType.COUNT:
+            if rule_a.predicate_args.get("entity_type") != rule_b.predicate_args.get("entity_type"):
+                return False
+            # a implies b if a's range is subset of b's
+            a_exp = rule_a.predicate_params.get("expected_count", 0)
+            a_tol = rule_a.predicate_params.get("tolerance", 0)
+            b_exp = rule_b.predicate_params.get("expected_count", 0)
+            b_tol = rule_b.predicate_params.get("tolerance", 0)
+            a_min, a_max = a_exp - a_tol, a_exp + a_tol
+            b_min, b_max = b_exp - b_tol, b_exp + b_tol
+            return a_min >= b_min and a_max <= b_max
         
-        for rel in graph.topological_relations:
-            src_type = graph.component_types.get(rel.source_id, "")
-            tgt_type = graph.component_types.get(rel.target_id, "")
-            
-            if src_type == rule.part_type and tgt_type == rule.target_part_type:
-                if rel.relation_type == rule.topological_relation.value:
-                    return True
         return False
     
-    def _check_composition(self, rule: NormalityRule, graph: SceneGraph) -> bool:
-        """Check composition rule."""
-        present_types = set(graph.component_types.values())
+    def compute_redundancy(self, rule: NormalityRule, existing_rules: List[NormalityRule]) -> float:
+        """Compute redundancy with existing rules.
         
-        # Check required types
-        for req_type in rule.required_part_types:
-            if req_type not in present_types:
-                return False
-        
-        # Check forbidden combinations
-        for forbidden in rule.forbidden_combinations:
-            if all(t in present_types for t in forbidden):
-                return False
-        
-        return True
-    
-    def _eval_semantic_coverage(self, rule: NormalityRule) -> float:
-        """Evaluate semantic dimension coverage."""
-        # Each rule type covers a different dimension
-        type_coverage = {
-            RuleType.COUNT: 1.0,
-            RuleType.ATTRIBUTE: 1.0,
-            RuleType.SPATIAL: 1.0,
-            RuleType.TOPOLOGICAL: 1.0,
-            RuleType.COMPOSITION: 1.0,
-            RuleType.CONDITIONAL: 1.0,
-        }
-        return type_coverage.get(rule.rule_type, 0.5)
-    
-    def _eval_complementarity(self, rule: NormalityRule) -> float:
-        """Evaluate complementarity with existing rules (placeholder)."""
-        # In practice, this would compare against current rule set
-        return 0.5
-    
-    def _eval_redundancy(self, rule: NormalityRule) -> float:
-        """Evaluate redundancy (lower is better)."""
-        # Check if rule is logically implied by others
-        return 0.2  # Placeholder
-    
-    def _eval_reliability(self, rule: NormalityRule) -> float:
-        """Evaluate rule reliability."""
-        return rule.reliability * rule.confidence
-    
-    def _eval_spatial_groundability(self, rule: NormalityRule) -> float:
-        """Evaluate if rule can produce spatial anomaly map."""
-        if not rule.spatial_groundable:
+        Returns max correlation of violation patterns.
+        """
+        if not existing_rules:
             return 0.0
-        strategy = rule.get_grounding_strategy()
-        strategy_scores = {
-            "missing_slots": 1.0,
-            "extra_objects": 1.0,
-            "attribute_map": 0.9,
-            "position_deviation": 0.9,
-            "connection_map": 0.8,
-            "composition_map": 0.7,
-            "count_mismatch": 0.6,
-        }
-        return strategy_scores.get(strategy, 0.5)
+        
+        # Collect violation vectors
+        rule_violations = []
+        for graph in self.support_graphs + self.anomaly_graphs:
+            result = self.executor.execute(graph)
+            r = next((r for r in result.rule_results if r.rule_id == rule.rule_id), None)
+            if r:
+                rule_violations.append(r.violation_score)
+        
+        if not rule_violations:
+            return 0.0
+        
+        max_corr = 0.0
+        for existing in existing_rules:
+            existing_violations = []
+            for graph in self.support_graphs + self.anomaly_graphs:
+                result = self.executor.execute(graph)
+                r = next((r for r in result.rule_results if r.rule_id == existing.rule_id), None)
+                if r:
+                    existing_violations.append(r.violation_score)
+            
+            if existing_violations and len(existing_violations) == len(rule_violations):
+                corr = np.corrcoef(rule_violations, existing_violations)[0, 1]
+                if np.isfinite(corr):
+                    max_corr = max(max_corr, abs(corr))
+        
+        return max_corr
+
+
+class RuleDependencyTracker:
+    """Tracks logical dependencies between rules."""
     
-    def _eval_complexity(self, rule: NormalityRule) -> float:
-        """Evaluate rule complexity (lower is better)."""
-        complexity = 1.0
-        if rule.conditions:
-            complexity += 0.5 * len(rule.conditions)
-        if rule.then_rule or rule.else_rule:
-            complexity += 1.0
-        if rule.rule_type in [RuleType.COMPOSITION, RuleType.CONDITIONAL]:
-            complexity += 0.5
-        return complexity
+    def __init__(self):
+        self.dependencies: Dict[str, Set[str]] = {}  # rule_id -> depends_on
+        self.reverse_deps: Dict[str, Set[str]] = {}  # rule_id -> implied_by
+        self.rule_objects: Dict[str, NormalityRule] = {}
+    
+    def add_rule(self, rule: NormalityRule, depends_on: Set[str], implied_by: Set[str]) -> None:
+        self.rule_objects[rule.rule_id] = rule
+        self.dependencies[rule.rule_id] = depends_on
+        self.reverse_deps[rule.rule_id] = implied_by
+        
+        # Update reverse deps
+        for dep in depends_on:
+            self.reverse_deps.setdefault(dep, set()).add(rule.rule_id)
+        for imp in implied_by:
+            self.dependencies.setdefault(imp, set()).add(rule.rule_id)
+    
+    def get_dependencies(self, rule_id: str) -> Set[str]:
+        return self.dependencies.get(rule_id, set())
+    
+    def get_dependents(self, rule_id: str) -> Set[str]:
+        return self.reverse_deps.get(rule_id, set())
+    
+    def has_cycle(self, rule_id: str) -> bool:
+        """Check if adding rule would create dependency cycle."""
+        visited = set()
+        stack = [rule_id]
+        while stack:
+            current = stack.pop()
+            if current in visited:
+                return True
+            visited.add(current)
+            stack.extend(self.dependencies.get(current, set()))
+        return False
 
 
-class NSGA2RuleSearch:
-    """NSGA-II multi-objective evolutionary search for rule sets."""
+class ValidationDrivenSearch:
+    """Validation-driven rule search with dependency awareness.
+    
+    Process:
+    1. Generate candidates from Qwen + mutations
+    2. Validate on normal supports (filter: must hold >= 90%)
+    3. Test on counterfactual anomalies (filter: AUROC >= 0.6)
+    4. Check dependencies and redundancy
+    4. Greedy coverage selection with dependency awareness
+    """
     
     def __init__(
         self,
         config: SearchConfig,
-        evaluator: RuleSearchEvaluator,
-        initial_rules: List[NormalityRule],
+        validator: RuleValidator,
+        executor: 'RuleExecutor',
     ):
         self.config = config
-        self.evaluator = evaluator
-        self.initial_rules = initial_rules
-        self.population: List[RuleCandidate] = []
-        self.archive: List[RuleCandidate] = []  # Pareto front
-        self.generation = 0
+        self.validator = validator
+        self.executor = executor
+        self.dependency_tracker = RuleDependencyTracker()
+        self.candidates: List[RuleCandidate] = []
+        self.accepted_rules: List[NormalityRule] = []
         self.rng = np.random.RandomState(config.random_seed)
     
-    def initialize_population(self) -> List[RuleCandidate]:
-        """Initialize population with mutations of initial rules."""
-        population = []
+    def run(
+        self,
+        qwen_rules: List[NormalityRule],
+        support_graphs: List[SceneGraph],
+        anomaly_graphs: List[SceneGraph],
+        support_masks: List[np.ndarray],
+        anomaly_masks: List[np.ndarray],
+    ) -> Tuple[RuleSet, List[Dict[str, Any]]]:
+        """Run validation-driven search."""
         
-        # Add initial rules
-        for rule in self.initial_rules:
-            candidate = RuleCandidate(rule=rule, generation=0)
-            self.evaluator.evaluate(candidate)
-            population.append(candidate)
+        # Initialize candidates from Qwen rules
+        self.candidates = [
+            RuleCandidate(rule=rule, generation=0)
+            for rule in qwen_rules
+        ]
         
-        # Generate variations
-        while len(population) < self.config.population_size:
-            base_rule = self.rng.choice(self.initial_rules)
-            mutated = self._mutate_rule(base_rule)
-            candidate = RuleCandidate(rule=mutated, generation=0)
-            self.evaluator.evaluate(candidate)
-            population.append(candidate)
+        # Add variations
+        self._expand_candidates()
         
-        self.population = population
-        return population
+        history = []
+        
+        for iteration in range(self.config.max_iterations):
+            # 1. Validate all candidates
+            self._validate_candidates()
+            
+            # 2. Filter by support hold rate
+            self.candidates = [
+                c for c in self.candidates
+                if c.support_hold_rate >= self.config.min_support_hold_rate
+            ]
+            
+            # 3. Filter by anomaly detection
+            self.candidates = [
+                c for c in self.candidates
+                if c.anomaly_detection_auroc >= self.config.min_anomaly_auroc
+            ]
+            
+            # 4. Compute redundancy and dependencies
+            self._compute_relations()
+            
+            # 5. Filter by redundancy
+            self.candidates = [
+                c for c in self.candidates
+                if c.redundancy_score <= self.config.max_redundancy
+            ]
+            
+            # 5. Compute fitness
+            self._compute_fitness()
+            
+            # 6. Select best candidates
+            self.candidates.sort(key=lambda c: c.fitness, reverse=True)
+            self.candidates = self.candidates[:self.config.max_candidates]
+            
+            # 6. Greedy coverage selection for final rule set
+            selected = self._greedy_coverage_selection()
+            self.accepted_rules = selected
+            
+            # Mutation and crossover for next generation
+            self._evolve_population()
+            
+            history.append({
+                "iteration": iteration,
+                "num_candidates": len(self.candidates),
+                "num_accepted": len(self.accepted_rules),
+                "best_fitness": max(c.fitness for c in self.candidates) if self.candidates else 0,
+            })
+            
+            print(f"Iteration {iteration}: {len(self.candidates)} candidates, {len(self.accepted_rules)} accepted")
+        
+        # Final selection
+        final_rules = self._greedy_coverage_selection()
+        rule_set = RuleSet(category="searched", rules=final_rules)
+        
+        return rule_set, history
+    
+    def _expand_candidates(self) -> None:
+        """Generate variations of initial rules."""
+        new_candidates = []
+        for candidate in self.candidates:
+            new_candidates.append(candidate)
+            # Mutate
+            for _ in range(3):
+                mutated = self._mutate_rule(candidate.rule)
+                new_candidates.append(RuleCandidate(rule=mutated, generation=1))
+        
+        self.candidates = new_candidates[:self.config.max_candidates]
     
     def _mutate_rule(self, rule: NormalityRule) -> NormalityRule:
-        """Create a mutated copy of a rule."""
+        """Create mutated copy of rule."""
         new_rule = copy.deepcopy(rule)
-        new_rule.rule_id = f"{rule.rule_id}_mut_{self.generation}"
+        new_rule.rule_id = f"{rule.rule_id}_mut_{random.randint(1000, 9999)}"
         
-        mutation_type = self.rng.choice([
-            "parameter", "threshold", "tolerance", "part_type"
-        ])
+        mutation_type = random.choice(["parameter", "threshold", "tolerance", "part_type"])
         
         if mutation_type == "parameter" and rule.rule_type == RuleType.COUNT:
             if new_rule.expected_count is not None:
-                delta = self.rng.choice([-1, 1])
-                new_rule.expected_count = max(0, new_rule.expected_count + delta)
+                new_rule.expected_count = max(0, new_rule.expected_count + self.rng.choice([-1, 1]))
         
         elif mutation_type == "threshold" and rule.rule_type == RuleType.SPATIAL:
             new_rule.spatial_threshold = np.clip(
@@ -371,237 +375,168 @@ class NSGA2RuleSearch:
                 new_rule.tolerance = max(0.01, new_rule.tolerance * self.rng.uniform(0.5, 2.0))
         
         elif mutation_type == "part_type":
-            # Change target part type
-            available_types = list(self.evaluator.prototype_bank.prototypes.keys())
-            if available_types:
-                new_rule.part_type = self.rng.choice(available_types)
+            # Could add new part type - simplified for now
+            pass
         
         return new_rule
     
-    def _crossover(self, parent1: RuleCandidate, parent2: RuleCandidate) -> RuleCandidate:
-        """Create offspring by combining two parents."""
-        # For rules, crossover means creating a composite rule
-        rule1, rule2 = parent1.rule, parent2.rule
-        
-        if rule1.rule_type == rule2.rule_type:
-            new_rule = copy.deepcopy(rule1)
-            new_rule.rule_id = f"cross_{self.generation}_{id(new_rule)}"
+    def _validate_candidates(self) -> None:
+        """Validate all candidates on supports and anomalies."""
+        for candidate in self.candidates:
+            # Support validation
+            candidate.support_hold_rate = self.validator.validate_on_supports(candidate.rule)
             
-            # Blend numeric parameters
-            if rule1.rule_type == RuleType.COUNT:
-                if rule1.expected_count is not None and rule2.expected_count is not None:
-                    new_rule.expected_count = int((rule1.expected_count + rule2.expected_count) / 2)
-                new_rule.count_tolerance = max(rule1.count_tolerance, rule2.count_tolerance)
-            
-            elif rule1.rule_type == RuleType.ATTRIBUTE:
-                if rule1.expected_value is not None and rule2.expected_value is not None:
-                    new_rule.expected_value = (rule1.expected_value + rule2.expected_value) / 2
-                if rule1.tolerance is not None and rule2.tolerance is not None:
-                    new_rule.tolerance = max(rule1.tolerance, rule2.tolerance)
-            
-            elif rule1.rule_type == RuleType.SPATIAL:
-                new_rule.spatial_threshold = max(rule1.spatial_threshold, rule2.spatial_threshold)
-            
-            # Combine metadata
-            new_rule.confidence = min(rule1.confidence, rule2.confidence)
-            new_rule.reliability = min(rule1.reliability, rule2.reliability)
-            new_rule.source = "evolution"
-            
-            return RuleCandidate(
-                rule=new_rule,
-                generation=self.generation,
-                parent_ids=(parent1.rule.rule_id, parent2.rule.rule_id),
+            # Anomaly discrimination
+            auroc, aupr = self.validator.validate_on_anomalies(candidate.rule)
+            candidate.anomaly_detection_auroc = auroc
+            candidate.anomaly_detection_aupr = aupr
+    
+    def _compute_relations(self) -> None:
+        """Compute dependencies and redundancy for all candidates."""
+        for candidate in self.candidates:
+            # Dependencies with accepted rules
+            depends_on, implied_by = self.validator.check_dependencies(
+                candidate.rule, self.accepted_rules
             )
-        
-        # Different types - return one parent with mutation
-        return self._mutate_rule(parent1.rule)
-    
-    def _tournament_selection(self, population: List[RuleCandidate]) -> RuleCandidate:
-        """Tournament selection based on Pareto dominance."""
-        tournament = self.rng.choice(population, size=self.config.tournament_size, replace=False)
-        
-        # Find non-dominated in tournament
-        non_dominated = []
-        for cand in tournament:
-            dominated = False
-            for other in tournament:
-                if other is cand:
-                    continue
-                if other.dominates(cand):
-                    dominated = True
-                    break
-            if not dominated:
-                non_dominated.append(cand)
-        
-        if non_dominated:
-            return self.rng.choice(non_dominated)
-        return self.rng.choice(tournament)
-    
-    def _fast_non_dominated_sort(
-        self, population: List[RuleCandidate]
-    ) -> List[List[RuleCandidate]]:
-        """Fast non-dominated sorting (NSGA-II)."""
-        n = len(population)
-        domination_count = [0] * n
-        dominated_sets = [[] for _ in range(n)]
-        fronts = [[]]
-        
-        for i in range(n):
-            for j in range(i + 1, n):
-                if population[i].dominates(population[j]):
-                    dominated_sets[i].append(j)
-                    domination_count[j] += 1
-                elif population[j].dominates(population[i]):
-                    dominated_sets[j].append(i)
-                    domination_count[i] += 1
-            if domination_count[i] == 0:
-                fronts[0].append(population[i])
-        
-        front_idx = 0
-        while fronts[front_idx]:
-            next_front = []
-            for i_idx, cand_i in enumerate(fronts[front_idx]):
-                # Find index in population
-                pop_idx = population.index(cand_i)
-                for j_idx in dominated_sets[pop_idx]:
-                    domination_count[j_idx] -= 1
-                    if domination_count[j_idx] == 0:
-                        next_front.append(population[j_idx])
-            front_idx += 1
-            fronts.append(next_front)
-        
-        return fronts[:-1]  # Remove empty last front
-    
-    def _crowding_distance(self, front: List[RuleCandidate]) -> Dict[RuleCandidate, float]:
-        """Calculate crowding distance for a front."""
-        if len(front) <= 2:
-            return {cand: float('inf') for cand in front}
-        
-        distances = {cand: 0.0 for cand in front}
-        objectives = list(front[0].fitness.keys())
-        
-        for obj in objectives:
-            sorted_front = sorted(front, key=lambda c: c.fitness.get(obj, 0))
-            obj_min = sorted_front[0].fitness.get(obj, 0)
-            obj_max = sorted_front[-1].fitness.get(obj, 0)
+            candidate.depends_on = depends_on
+            candidate.implied_by = implied_by
             
-            if obj_max == obj_min:
+            # Redundancy with accepted rules
+            candidate.redundancy_score = self.validator.compute_redundancy(
+                candidate.rule, self.accepted_rules
+            )
+    
+    def _compute_fitness(self) -> None:
+        """Compute fitness for each candidate."""
+        for candidate in self.candidates:
+            fitness = (
+                self.config.w_support * candidate.support_hold_rate +
+                self.config.w_anomaly * candidate.anomaly_detection_auroc +
+                self.config.w_novelty * (1.0 - candidate.redundancy_score)
+            )
+            # Penalty for high redundancy
+            if candidate.redundancy_score > 0.5:
+                fitness *= (1.0 - candidate.redundancy_score)
+            candidate.fitness = fitness
+    
+    def _greedy_coverage_selection(self) -> List[NormalityRule]:
+        """Greedy selection for maximum anomaly coverage with dependency awareness."""
+        # Sort by fitness
+        sorted_candidates = sorted(self.candidates, key=lambda c: c.fitness, reverse=True)
+        
+        selected = []
+        covered_anomaly_types = set()
+        dependency_tracker = RuleDependencyTracker()
+        
+        for candidate in sorted_candidates:
+            # Check if dependencies are satisfied
+            deps_satisfied = all(
+                dep in [r.rule_id for r in selected]
+                for dep in candidate.depends_on
+            )
+            if not deps_satisfied:
                 continue
             
-            distances[sorted_front[0]] = float('inf')
-            distances[sorted_front[-1]] = float('inf')
+            # Check if adds novel coverage
+            executor = self.executor
+            new_coverage = 0
+            for graph in self.validator.anomaly_graphs:
+                result = executor.execute(graph)
+                r = next((r for r in result.rule_results if r.rule_id == candidate.rule.rule_id), None)
+                if r and r.violation_score > 1e-6:
+                    # This rule catches this anomaly type
+                    anomaly_type = "unknown"  # Would need proper typing
+                    if anomaly_type not in covered_anomaly_types:
+                        new_coverage += 1
+                        covered_anomaly_types.add(anomaly_type)
             
-            for i in range(1, len(sorted_front) - 1):
-                prev_val = sorted_front[i-1].fitness.get(obj, 0)
-                next_val = sorted_front[i+1].fitness.get(obj, 0)
-                distances[sorted_front[i]] += (next_val - prev_val) / (obj_max - obj_min)
+            if new_coverage > 0 or not selected:
+                selected.append(candidate.rule)
+                # Track dependencies
+                for dep in candidate.depends_on:
+                    dependency_tracker.add_rule(candidate.rule, candidate.depends_on, candidate.implied_by)
         
-        return distances
+        return [c.rule for c in selected]
     
-    def run(self) -> Tuple[List[NormalityRule], List[Dict[str, Any]]]:
-        """Run NSGA-II search and return Pareto-optimal rule set."""
-        self.population = self.initialize_population()
-        history = []
+    def _evolve_population(self) -> None:
+        """Evolve population for next generation."""
+        # Elite preservation
+        elite = self.candidates[:self.config.elite_size]
+        new_population = [copy.deepcopy(c) for c in elite]
         
-        for gen in range(self.config.max_generations):
-            self.generation = gen
+        # Generate offspring
+        while len(new_population) < self.config.max_candidates:
+            if self.rng.random() < self.config.crossover_rate and len(self.candidates) >= 2:
+                parent1 = self.rng.choice(self.candidates[:10])
+                parent2 = self.rng.choice(self.candidates[:10])
+                child_rule = self._crossover(parent1.rule, parent2.rule)
+            else:
+                parent = self.rng.choice(self.candidates[:10])
+                child_rule = self._mutate_rule(parent.rule)
             
-            # Create offspring
-            offspring = []
-            while len(offspring) < self.config.population_size:
-                parent1 = self._tournament_selection(self.population)
-                parent2 = self._tournament_selection(self.population)
-                
-                if self.rng.random() < self.config.crossover_rate:
-                    child = self._crossover(parent1, parent2)
-                else:
-                    child = RuleCandidate(
-                        rule=copy.deepcopy(parent1.rule),
-                        generation=gen,
-                        parent_ids=(parent1.rule.rule_id,),
-                    )
-                
-                # Mutation
-                if self.rng.random() < self.config.mutation_rate:
-                    child.rule = self._mutate_rule(child.rule)
-                
-                self.evaluator.evaluate(child)
-                offspring.append(child)
-            
-            # Combine and select
-            combined = self.population + offspring
-            fronts = self._fast_non_dominated_sort(combined)
-            
-            new_population = []
-            for front in fronts:
-                if len(new_population) + len(front) <= self.config.population_size:
-                    new_population.extend(front)
-                else:
-                    # Crowding distance selection
-                    distances = self._crowding_distance(front)
-                    front_sorted = sorted(front, key=lambda c: distances[c], reverse=True)
-                    needed = self.config.population_size - len(new_population)
-                    new_population.extend(front_sorted[:needed])
-                    break
-            
-            self.population = new_population
-            
-            # Update archive (Pareto front)
-            self._update_archive()
-            
-            # Record history
-            history.append({
-                "generation": gen,
-                "population_size": len(self.population),
-                "archive_size": len(self.archive),
-                "best_fitness": self._get_best_fitness(),
-            })
-            
-            print(f"Generation {gen}: pop={len(self.population)}, archive={len(self.archive)}")
+            child = RuleCandidate(rule=child_rule, generation=0)
+            new_population.append(child)
         
-        # Return archive rules
-        final_rules = [cand.rule for cand in self.archive]
-        return final_rules, history
+        self.candidates = new_population[:self.config.max_candidates]
     
-    def _update_archive(self):
-        """Update Pareto archive with current population."""
-        # Combine archive and population
-        combined = self.archive + self.population
-        fronts = self._fast_non_dominated_sort(combined)
+    def _crossover(self, rule1: NormalityRule, rule2: NormalityRule) -> NormalityRule:
+        """Crossover two rules of same type."""
+        if rule1.predicate_name != rule2.predicate_name:
+            return copy.deepcopy(rule1)
         
-        # Keep only first front (Pareto optimal)
-        self.archive = fronts[0] if fronts else []
-    
-    def _get_best_fitness(self) -> Dict[str, float]:
-        """Get best fitness values across objectives."""
-        if not self.archive:
-            return {}
+        new_rule = copy.deepcopy(rule1)
+        new_rule.rule_id = f"cross_{rule1.rule_id}_{rule2.rule_id}"
         
-        best = {}
-        for obj in self.archive[0].fitness:
-            best[obj] = max(c.fitness.get(obj, 0) for c in self.archive)
-        return best
+        # Blend numeric parameters
+        if rule1.rule_type == RuleType.COUNT:
+            if rule1.expected_count is not None and rule2.expected_count is not None:
+                new_rule.expected_count = int((rule1.expected_count + rule2.expected_count) / 2)
+            new_rule.count_tolerance = max(rule1.count_tolerance, rule2.count_tolerance)
+        
+        elif rule1.rule_type == RuleType.ATTRIBUTE:
+            if rule1.expected_value is not None and rule2.expected_value is not None:
+                new_rule.expected_value = (rule1.expected_value + rule2.expected_value) / 2
+            if rule1.tolerance is not None and rule2.tolerance is not None:
+                new_rule.tolerance = max(rule1.tolerance, rule2.tolerance)
+        
+        elif rule1.rule_type == RuleType.SPATIAL:
+            new_rule.spatial_threshold = max(rule1.spatial_threshold, rule2.spatial_threshold)
+        
+        new_rule.confidence = min(rule1.confidence, rule2.confidence)
+        new_rule.reliability = min(rule1.reliability, rule2.reliability)
+        new_rule.source = "evolution"
+        
+        return new_rule
 
 
-def run_rule_search(
+def run_validation_driven_search(
     qwen_rules: List[NormalityRule],
     support_graphs: List[SceneGraph],
+    anomaly_graphs: List[SceneGraph],
+    support_masks: List[np.ndarray],
+    anomaly_masks: List[np.ndarray],
+    executor: 'RuleExecutor',
     prototype_bank: SemanticPrototypeBank,
-    normal_masks: List[np.ndarray],
     config: Optional[SearchConfig] = None,
 ) -> Tuple[RuleSet, List[Dict[str, Any]]]:
-    """Run complete rule search pipeline."""
+    """Run validation-driven rule search."""
     if config is None:
         config = SearchConfig()
     
-    evaluator = RuleSearchEvaluator(
-        support_graphs, prototype_bank, normal_masks, config
+    validator = RuleValidator(
+        support_graphs, [], anomaly_graphs, anomaly_masks,
+        executor, prototype_bank
     )
     
-    search = NSGA2RuleSearch(config, evaluator, qwen_rules)
-    final_rules, history = search.run()
-    
-    # Create final rule set
-    rule_set = RuleSet(category="unknown", rules=final_rules)
+    search = ValidationDrivenSearch(config, validator, executor)
+    rule_set, history = search.run(
+        qwen_rules, support_graphs, anomaly_graphs, [], anomaly_masks
+    )
     
     return rule_set, history
+
+
+__all__ = [
+    "RuleCandidate", "SearchConfig", "RuleValidator", "RuleDependencyTracker",
+    "ValidationDrivenSearch", "run_validation_driven_search",
+]

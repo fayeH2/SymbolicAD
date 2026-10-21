@@ -258,7 +258,10 @@ def main() -> int:
                 **epoch_row,
             }), flush=True)
 
-    window = min(10, len(history))
+    # Keep the first and last windows disjoint.  Using the entire history for
+    # both windows made short smoke runs incorrectly report no decrease even
+    # when every logged component dropped.
+    window = min(10, max(1, len(history) // 2))
     first_mean = float(np.mean([row["total_loss"] for row in history[:window]]))
     last_mean = float(np.mean([row["total_loss"] for row in history[-window:]]))
     tail_x = np.arange(window, dtype=float)

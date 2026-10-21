@@ -140,8 +140,10 @@ def _histogram_auc(positive: np.ndarray, negative: np.ndarray) -> float | None:
         return None
     tpr = np.concatenate(([0.0], np.cumsum(positive[::-1]) / pos_total, [1.0]))
     fpr = np.concatenate(([0.0], np.cumsum(negative[::-1]) / neg_total, [1.0]))
-    # NumPy 2 removed the long-deprecated ``trapz`` alias.
-    return float(np.trapezoid(tpr, fpr))
+    # NumPy 2 prefers ``trapezoid`` while the older H2VLR environment only
+    # provides ``trapz``.  They implement the same composite trapezoidal rule.
+    integrate = getattr(np, "trapezoid", np.trapz)
+    return float(integrate(tpr, fpr))
 
 
 def _ensure_symlink(link: Path, target: Path) -> None:

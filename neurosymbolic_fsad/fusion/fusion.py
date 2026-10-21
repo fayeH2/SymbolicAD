@@ -1,4 +1,8 @@
-"""Anomaly fusion module for combining visual and logic anomalies."""
+"""Anomaly fusion module for combining visual and logic anomalies.
+
+Key principle: Logic rules can detect anomalies INDEPENDENTLY of visual evidence.
+Fusion combines evidence but does NOT gate logic by visual.
+"""
 
 from __future__ import annotations
 
@@ -18,11 +22,9 @@ class FusionConfig:
     # Logic anomaly weight
     logic_weight: float = 1.0
     
-    # Grounding confidence threshold
-    grounding_threshold: float = 0.1
-    
-    # Fusion method: "weighted_sum", "probabilistic_or", "grounded_and_or"
-    fusion_method: str = "grounded_and_or"
+    # Fusion method: "or", "weighted_or", "weighted_sum", "max"
+    # NO "grounded_and_or" - logic is NOT gated by visual
+    fusion_method: str = "or"
     
     # Calibration parameters
     visual_calibration: Optional[Dict[str, float]] = None
@@ -38,8 +40,8 @@ class FusionConfig:
 @dataclass
 class FusionResult:
     """Result of anomaly fusion."""
-    fused_map: np.ndarray  # [H, W] fused anomaly map
-    fused_score: float     # Image-level anomaly score
+    fused_map: np.ndarray      # [H, W] fused anomaly map
+    fused_score: float         # Image-level anomaly score
     visual_map: np.ndarray
     logic_map: np.ndarray
     visual_score: float
@@ -49,7 +51,17 @@ class FusionResult:
 
 
 class AnomalyFusion:
-    """Fuse INP-Former visual anomaly with logic-based anomaly."""
+    """Fuse INP-Former visual anomaly with logic-based anomaly.
+    
+    Key principle: Logic rules can detect anomalies INDEPENDENTLY of visual evidence.
+    Fusion combines evidence but does NOT gate logic by visual.
+    
+    Supported methods:
+    - "or": Probabilistic OR = 1 - (1-v)(1-l)
+    - "weighted_or": Weighted probabilistic OR
+    - "max": Element-wise maximum
+    - "weighted_sum": Weighted average
+    """
     
     def __init__(self, config: Optional[FusionConfig] = None):
         self.config = config or FusionConfig()
@@ -60,10 +72,12 @@ class AnomalyFusion:
         visual_score: float,
         logic_map: np.ndarray,
         logic_score: float,
-        grounding_confidence: Optional[np.ndarray] = None,
         rule_contributions: Optional[Dict[str, np.ndarray]] = None,
     ) -> FusionResult:
-        """Fuse visual and logic anomaly maps."""
+        """Fuse visual and logic anomaly maps.
+        
+        Logic is NOT gated by visual. Both contribute independently.
+        """
         
         # Ensure maps are same size
         if visual_map.shape != logic_map.shape:
@@ -80,39 +94,32 @@ class AnomalyFusion:
         visual_map_cal = self._calibrate_map(visual_map, "visual")
         logic_map_cal = self._calibrate_map(logic_map, "logic")
         
-        # Apply grounding gating if available
-        if grounding_confidence is not None:
-            logic_map_cal = logic_map_cal * grounding_confidence
-            logic_score_cal = logic_score_cal * float(np.mean(grounding_confidence))
+        # NO grounding gating - logic contributes independently
+        # logic_map_cal is used as-is
         
         # Fuse maps
-        if self.config.fusion_method == "weighted_sum":
-            fused_map = (
-                self.config.visual_weight * visual_map_cal +
-                self.config.logic_weight * logic_map_cal
-            ) / (self.config.visual_weight + self.config.logic_weight)
-            fused_score = (
-                self.config.visual_weight * visual_score_cal +
-                self.config.logic_weight * logic_score_cal
-            ) / (self.config.visual_weight + self.config.logic_weight)
-        
-        elif self.config.fusion_method == "probabilistic_or":
+        if self.config.fusion_method == "or":
             # Probabilistic OR
             fused_map = 1.0 - (1.0 - visual_map_cal) * (1.0 - logic_map_cal)
             fused_score = 1.0 - (1.0 - visual_score_cal) * (1.0 - logic_score_cal)
         
-        elif self.config.fusion_method == "grounded_and_or":
-            # Grounded neuro-symbolic: OR(visual, AND(visual_grounding, logic))
-            # visual_grounding is the visual anomaly itself (confidence in visual evidence)
-            # This prevents logic-only hotspots without visual support
-            visual_grounding = visual_map_cal
-            logic_gated = visual_grounding * logic_map_cal
-            fused_map = 1.0 - (1.0 - visual_map_cal) * (1.0 - logic_gated)
-            
-            # Image-level score
-            visual_grounding_score = visual_score_cal
-            logic_gated_score = visual_grounding_score * logic_score_cal
-            fused_score = 1.0 - (1.0 - visual_score_cal) * (1.0 - logic_gated_score)
+        elif self.config.fusion_method == "weighted_or":
+            # Weighted probabilistic OR
+            fused_map = 1.0 - (1.0 - self.config.visual_weight * visual_map_cal) * \
+                               (1.0 - self.config.logic_weight * logic_map_cal)
+            fused_score = 1.0 - (1.0 - self.config.visual_weight * visual_score_cal) * \
+                               (1.0 - self.config.logic_weight * logic_score_cal)
+        
+        elif self.config.fusion_method == "max":
+            fused_map = np.maximum(visual_map_cal, logic_map_cal)
+            fused_score = max(visual_score_cal, logic_score_cal)
+        
+        elif self.config.fusion_method == "weighted_sum":
+            total_w = self.config.visual_weight + self.config.logic_weight
+            fused_map = (self.config.visual_weight * visual_map_cal + 
+                         self.config.logic_weight * logic_map_cal) / total_w
+            fused_score = (self.config.visual_weight * visual_score_cal + 
+                           self.config.logic_weight * logic_score_cal) / total_w
         
         else:
             fused_map = visual_map_cal
@@ -151,7 +158,6 @@ class AnomalyFusion:
         """Calibrate raw score to [0, 1] probability."""
         if modality == "visual" and self.config.visual_calibration:
             cal = self.config.visual_calibration
-            # Sigmoid calibration
             center = cal.get("center", 0.5)
             scale = cal.get("scale", 1.0)
             return 1.0 / (1.0 + np.exp(-(score - center) / scale))
@@ -184,12 +190,11 @@ class AnomalyFusion:
         normal_logic_scores: List[float],
     ) -> "AnomalyFusion":
         """Calibrate fusion parameters from normal samples."""
-        # Compute statistics on normal samples
         visual_scores = np.array(normal_visual_scores)
         logic_scores = np.array(normal_logic_scores)
         
         visual_center = float(np.median(visual_scores))
-        visual_scale = float(np.std(visual_scores) * 1.4826)  # MAD-based
+        visual_scale = float(np.std(visual_scores) * 1.4826)
         
         logic_center = float(np.median(logic_scores))
         logic_scale = float(np.std(logic_scores) * 1.4826)
@@ -234,11 +239,10 @@ class AdaptiveFusion(AnomalyFusion):
                 val_visual_maps, val_logic_maps, val_labels, val_masks
             ):
                 fused = (w_vis * v_map + w_log * l_map) / (w_vis + w_log)
-                img_score = float(np.mean(fused))
                 pix_auc = roc_auc_score(mask.flatten(), fused.flatten())
                 aucs.append(pix_auc)
             
-            return -np.mean(aucs)  # Minimize negative AUC
+            return -np.mean(aucs)
         
         result = minimize(objective, [1.0, 1.0], bounds=[(0, 5), (0, 5)])
         
@@ -258,16 +262,43 @@ def compute_grounding_confidence(
 ) -> np.ndarray:
     """Compute grounding confidence map.
     
+    This is for DIAGNOSTIC PURPOSES ONLY - not for gating logic.
     High confidence where both logic and visual anomalies agree.
-    Low confidence where logic fires but visual doesn't (potential false positive).
-    """
-    # Visual evidence strength
-    visual_evidence = np.clip(visual_map / (threshold + 1e-6), 0, 1)
+    Low confidence where logic fires but visual doesn't.
     
-    # Logic anomaly strength
+    Returns confidence in [0, 1] per pixel.
+    """
+    visual_evidence = np.clip(visual_map / (threshold + 1e-6), 0, 1)
+    logic_strength = logic_map
+    confidence = 0.5 + 0.5 * visual_evidence * logic_strength
+    return confidence
+
+
+def compute_logic_only_confidence(
+    logic_map: np.ndarray,
+    visual_map: np.ndarray,
+    threshold: float = 0.1,
+) -> np.ndarray:
+    """Compute confidence that logic detection is genuine (not false positive).
+    
+    Returns high confidence when:
+    - Logic fires AND visual confirms (true positive)
+    - Logic fires BUT visual doesn't (uncertain - could be logic-only anomaly)
+    
+    Returns low confidence when:
+    - Logic fires but visual strongly contradicts (likely false positive)
+    """
+    visual_evidence = np.clip(visual_map / (threshold + 1e-6), 0, 1)
     logic_strength = logic_map
     
-    # Confidence is high when visual supports logic
-    confidence = 0.5 + 0.5 * visual_evidence * logic_strength
+    # High confidence when both agree
+    agreement = visual_evidence * logic_strength
     
-    return confidence
+    # Medium confidence when logic fires alone (logic-only anomaly)
+    logic_only = logic_strength * (1.0 - visual_evidence)
+    
+    # Low confidence when visual contradicts logic
+    contradiction = (1.0 - logic_strength) * visual_evidence
+    
+    confidence = 0.8 * agreement + 0.5 * logic_only + 0.1 * contradiction
+    return np.clip(confidence, 0, 1)

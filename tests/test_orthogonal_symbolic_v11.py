@@ -4,7 +4,7 @@ from neurosymbolic_fsad.generic_relations import GenericComponentGrounder
 from neurosymbolic_fsad.orthogonal_symbolic import _symbolic_candidate_pool
 
 
-def test_llm_seed_is_expanded_as_search_candidates_not_accepted_rules():
+def test_llm_seed_is_not_expanded_with_unproposed_constraints():
     proposal = {
         "primary_entity": {
             "id": "visible_parts", "expected_count": 3, "arrangement": "row",
@@ -13,14 +13,8 @@ def test_llm_seed_is_expanded_as_search_candidates_not_accepted_rules():
     }
     pool = _symbolic_candidate_pool(proposal)["rules"]
     by_predicate = {row["predicate"]: row for row in pool}
-    assert set(by_predicate) == {
-        "count_eq", "arrangement_eq", "appearance_consistency",
-        "similar_size", "similar_orientation", "ordered_spacing",
-    }
+    assert set(by_predicate) == {"count_eq"}
     assert by_predicate["count_eq"]["candidate_origin"] == "llm_seed"
-    assert by_predicate["similar_size"]["candidate_origin"] == (
-        "symbolic_operator_enumeration"
-    )
 
 
 def test_missing_count_localizer_marks_only_the_unmatched_normal_slot():

@@ -1,4 +1,4 @@
-"""Qwen-VL interface for offline rule generation."""
+"""Qwen-VL interface for offline rule generation (compatible with extensible DSL)."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import torch
 from neurosymbolic_fsad.rules.generation.dsl import (
     NormalityRule, RuleSet, RuleType, parse_qwen_rules,
     QWEN_RULE_GENERATION_PROMPT, QWEN_RULE_VALIDATION_PROMPT,
+    REGISTRY,
 )
 from neurosymbolic_fsad.perception.scene_graph import SceneGraph
 
@@ -235,7 +236,7 @@ class QwenVLRuleRefiner:
         self,
         rules: List[NormalityRule],
         support_images: Sequence[Union[str, Path]],
-        scene_graphs: Sequence[SceneGraph],
+        scene_graphs: Sequence[Any],  # SceneGraph
     ) -> List[NormalityRule]:
         """Refine rules based on visual verification and scene graph consistency."""
         # Validate each rule on support images
@@ -268,7 +269,7 @@ class QwenVLRuleRefiner:
     def suggest_additional_rules(
         self,
         current_rules: List[NormalityRule],
-        scene_graphs: Sequence[SceneGraph],
+        scene_graphs: Sequence[Any],  # SceneGraph
         category: str,
     ) -> List[NormalityRule]:
         """Ask Qwen-VL to suggest additional rules based on current rule set and scene graphs."""
