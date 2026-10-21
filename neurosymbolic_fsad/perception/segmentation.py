@@ -194,6 +194,7 @@ def extract_attributes(image: np.ndarray, instance: ComponentInstance) -> Dict[s
         mask[y0:y1, x0:x1].astype(np.uint8),
         cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
+    length = 0.0
     if contours:
         contour = max(contours, key=cv2.contourArea)
         area = cv2.contourArea(contour)
@@ -204,8 +205,14 @@ def extract_attributes(image: np.ndarray, instance: ComponentInstance) -> Dict[s
         aspect_ratio = float(w) / max(h, 1)
         circularity = 4 * np.pi * area / (perimeter * perimeter) if perimeter > 0 else 0
         solidity = area / hull_area if hull_area > 0 else 0
+        # Approximate length from major axis of fitted ellipse
+        if len(contour) >= 5:
+            ellipse = cv2.fitEllipse(contour)
+            length = max(ellipse[1]) / max(h, w)  # Normalized major axis
+        else:
+            length = max(w, h) / max(h, w)
     else:
-        area = perimeter = aspect_ratio = circularity = solidity = 0.0
+        area = perimeter = aspect_ratio = circularity = solidity = length = 0.0
 
     return {
         "color_h": mean_h, "color_s": mean_s, "color_v": mean_v,
@@ -214,6 +221,7 @@ def extract_attributes(image: np.ndarray, instance: ComponentInstance) -> Dict[s
         "shape_aspect": aspect_ratio, "shape_circularity": circularity,
         "shape_solidity": solidity,
         "bbox_width": x1 - x0, "bbox_height": y1 - y0,
+        "shape_length": length,
     }
 
 

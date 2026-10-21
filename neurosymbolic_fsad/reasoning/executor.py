@@ -86,7 +86,7 @@ class CountExecutor(PredicateExecutor):
         }
         
         # Generate witness map
-        witness_map = self._make_count_witness(rule, graph, count, expected, target_type)
+        witness_map = self._make_count_witness(rule, graph, count, expected, target_type, normal_slots)
         
         return violation, details, witness_map
     
@@ -97,10 +97,11 @@ class CountExecutor(PredicateExecutor):
             None, graph, 
             details.get("actual", 0), 
             details.get("expected", 0),
-            details.get("target_type")
+            details.get("target_type"),
+            normal_slots
         )
     
-    def _make_count_witness(self, rule, graph, actual_count, expected_count, target_type):
+    def _make_count_witness(self, rule, graph, actual_count, expected_count, target_type, normal_slots):
         map_size = 256
         witness = np.zeros((map_size, map_size), dtype=np.float32)
         
@@ -129,10 +130,29 @@ class CountExecutor(PredicateExecutor):
 class AttributeExecutor(PredicateExecutor):
     """Executor for ATTRIBUTE predicates (LENGTH, WIDTH, COLOR, etc.)."""
     
+    # Mapping from predicate name to feature key
+    ATTRIBUTE_FEATURE_MAP = {
+        "LENGTH": "shape_length",
+        "WIDTH": "shape_width", 
+        "HEIGHT": "shape_height",
+        "AREA": "shape_area",
+        "ASPECT_RATIO": "shape_aspect",
+        "CIRCULARITY": "shape_circularity",
+        "SOLIDITY": "shape_solidity",
+        "COLOR_H": "color_h",
+        "COLOR_S": "color_s",
+        "COLOR_V": "color_v",
+        "ASPECT_RATIO": "shape_aspect",
+        "CIRCULARITY": "shape_circularity",
+        "SOLIDITY": "shape_solidity",
+    }
+    
     def execute(self, rule: 'NormalityRule', graph: 'SceneGraph',
                 normal_slots: Dict[int, Dict[str, Any]]) -> Tuple[float, Dict[str, Any], Optional[np.ndarray]]:
         target_type = rule.predicate_args.get("entity_type")
         attr_name = rule.predicate_name.upper()
+        # Map predicate name to actual feature key
+        feature_key = self.ATTRIBUTE_FEATURE_MAP.get(attr_name, attr_name.lower())
         expected = rule.predicate_params.get("expected_value", 0)
         tol = rule.predicate_params.get("tolerance", 0.1)
         direction = rule.predicate_params.get("direction", "stable")
@@ -143,7 +163,7 @@ class AttributeExecutor(PredicateExecutor):
         
         for i, comp in enumerate(graph.components):
             if target_type is None or graph.component_types.get(id(comp), "") == target_type:
-                attr_val = comp.features.get(attr_name.lower())
+                attr_val = comp.features.get(feature_key)
                 if attr_val is not None:
                     all_values.append(attr_val)
                     if rule.predicate_params.get("direction", "stable") == "stable":
