@@ -34,7 +34,7 @@ def test_sam_dino_segmenter():
     data_root = get_loco_data_root()
     checkpoint = '/home/hjh/Desktop/H2VLR_compare/INP-Former/saved_results/INP-Former-Few-Shot-4_dataset=MVTec-AD_Encoder=dinov2reg_vit_base_14_Resize=448_Crop=392_INP_num=6/model.pth'
     
-    # Create SAM+DINOv2 segmenter with ViT-B
+    # Create SAM+DINOv2 segmenter
     print("Loading SAM + DINOv2 segmenter...")
     segmenter = SamDinoSegmenterWrapper(
         sam_checkpoint="/home/hjh/AgentModels/sam_vit_b_01ec64.pth",
