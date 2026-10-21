@@ -28,8 +28,8 @@ PROJECT = Path(__file__).resolve().parent.parent
 if str(PROJECT) not in sys.path:
     sys.path.insert(0, str(PROJECT))
 
-from neurosymbolic_fsad.data import select_inpformer_support
-from neurosymbolic_fsad.training_utils import (
+from symbolicAD.data import select_inpformer_support
+from symbolicAD.training_utils import (
     WarmCosineScheduler,
     augmentation,
     global_cosine_hm_adaptive,
@@ -286,8 +286,8 @@ def main() -> int:
     })
     source_paths = [
         Path(__file__).resolve(),
-        PROJECT / "neurosymbolic_fsad" / "data.py",
-        PROJECT / "neurosymbolic_fsad" / "training_utils.py",
+        PROJECT / "symbolicAD" / "data.py",
+        PROJECT / "symbolicAD" / "training_utils.py",
     ]
     _dump(checkpoint.parent / "training_manifest.json", {
         "schema_version": "isolated-generic-inpformer-v2",

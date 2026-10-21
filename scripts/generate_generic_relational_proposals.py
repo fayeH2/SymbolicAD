@@ -12,14 +12,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from neurosymbolic_fsad.data import (
+from symbolicAD.data import (
     MPDD_CLASS_ORDER, MVTEC_CLASS_ORDER, VISA_CLASS_ORDER, select_inpformer_support,
 )
-from neurosymbolic_fsad.qwen_generic_relations import (
+from symbolicAD.qwen_generic_relations import (
     QwenGenericRelationalProposer,
     consensus_generic_relational_proposals,
 )
-from neurosymbolic_fsad.qwen_relations import make_rgb_support_montage
+from symbolicAD.qwen_relations import make_rgb_support_montage
 
 
 def main() -> None:

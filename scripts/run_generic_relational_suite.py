@@ -10,8 +10,8 @@ from pathlib import Path
 
 import numpy as np
 
-from neurosymbolic_fsad.data import MPDD_CLASS_ORDER, MVTEC_CLASS_ORDER, VISA_CLASS_ORDER
-from neurosymbolic_fsad.experiment_generic_relational import run
+from symbolicAD.data import MPDD_CLASS_ORDER, MVTEC_CLASS_ORDER, VISA_CLASS_ORDER
+from symbolicAD.experiment_generic_relational import run
 
 
 def main() -> None:

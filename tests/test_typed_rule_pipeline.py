@@ -1,18 +1,24 @@
+"""第一阶段可执行验收：规则结构、能力边界、三态、grounding 与选择器。
+
+这些 fixture 刻意不依赖 GPU/LLM，使失败能唯一指向规则逻辑而非模型随机性。
+真实 LOCO 实验只有在这些确定性契约全部通过后才有解释价值。
+"""
+
 import numpy as np
 
-from neurosymbolic_fsad.grounding.instance_grounder import InstanceGrounder
-from neurosymbolic_fsad.perception.component_instances import ComponentInstance
-from neurosymbolic_fsad.perception.scene_graph import SceneGraph
-from neurosymbolic_fsad.reasoning.constraint_executor import (
+from symbolicAD.grounding.instance_grounder import InstanceGrounder
+from symbolicAD.perception.component_instances import ComponentInstance
+from symbolicAD.perception.scene_graph import SceneGraph
+from symbolicAD.reasoning.constraint_executor import (
     ConstraintExecutor, ConstraintOperator, combine_statuses,
 )
-from neurosymbolic_fsad.reasoning.predicate_executor import ExecutionContext
-from neurosymbolic_fsad.reasoning.violation_result import RuleStatus
-from neurosymbolic_fsad.rules.rule_compiler import (
+from symbolicAD.reasoning.predicate_executor import ExecutionContext
+from symbolicAD.reasoning.violation_result import RuleStatus
+from symbolicAD.rules.rule_compiler import (
     CompileDisposition, RuleCompiler, SupportRuleInducer,
 )
-from neurosymbolic_fsad.rules.rule_optimizer import GreedyRuleSetOptimizer
-from neurosymbolic_fsad.rules.rule_schema import RuleSpec
+from symbolicAD.rules.rule_optimizer import GreedyRuleSetOptimizer
+from symbolicAD.rules.rule_schema import RuleSpec
 
 
 def _mask(index, count, shape=(64, 64)):
@@ -38,6 +44,7 @@ def _context(rows, *, map_size=64, confidence=1.0):
 
 
 def _length_only_support():
+    """数量/颜色/aspect 不稳定，但显式 length 稳定的四张正常 support。"""
     counts = [1, 2, 3, 4]
     contexts = []
     for scene_index, count in enumerate(counts):
@@ -53,6 +60,7 @@ def _length_only_support():
 
 
 def test_length_only_support_induces_length_without_proxy_mapping():
+    """核心回归：只能提出并执行 length，query 也只能由 length 触发。"""
     support = _length_only_support()
     induced = SupportRuleInducer().induce(support)
     assert induced.structure_signature == ("length_range",)
@@ -80,6 +88,7 @@ def test_length_only_support_induces_length_without_proxy_mapping():
 
 
 def test_same_pipeline_learns_different_rule_structure_for_count_only_category():
+    """同一代码在另一支持结构上应自动得到 count，而不是类别硬编码。"""
     support = [
         _context([
             {"length": 0.2 + 0.1 * scene, "aspect_ratio": 0.5 + scene,
@@ -140,6 +149,7 @@ def test_three_valued_normality_operators():
 
 
 def test_three_grounding_levels_share_executor_and_keep_gt_out_of_auto_inference():
+    """三层实验只替换规则/感知来源，不偷偷替换 executor 或使用 query GT。"""
     normal = np.zeros((64, 64), dtype=np.int32)
     normal[30:34, 16:48] = 1
     short = np.zeros((64, 64), dtype=np.int32)

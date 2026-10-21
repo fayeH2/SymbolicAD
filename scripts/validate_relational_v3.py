@@ -302,14 +302,14 @@ def _source_runtime_audit(
 ) -> Dict[str, Any]:
     """Static import audit plus a subprocess run with LLM imports denied."""
     source_paths = [
-        repo_root / "neurosymbolic_fsad" / "relational_inference.py",
-        repo_root / "neurosymbolic_fsad" / "cable_relations.py",
-        repo_root / "neurosymbolic_fsad" / "inpformer_adapter.py",
+        repo_root / "symbolicAD" / "relational_inference.py",
+        repo_root / "symbolicAD" / "cable_relations.py",
+        repo_root / "symbolicAD" / "inpformer_adapter.py",
     ]
     forbidden_prefixes = (
         "transformers",
-        "neurosymbolic_fsad.qwen_relations",
-        "neurosymbolic_fsad.qwen_rules",
+        "symbolicAD.qwen_relations",
+        "symbolicAD.qwen_rules",
     )
     imported_modules: Dict[str, List[str]] = {}
     forbidden_imports: List[Dict[str, str]] = []
@@ -345,21 +345,21 @@ import json
 import sys
 
 class DenyLLM(importlib.abc.MetaPathFinder):
-    blocked = ("transformers", "neurosymbolic_fsad.qwen_relations", "neurosymbolic_fsad.qwen_rules")
+    blocked = ("transformers", "symbolicAD.qwen_relations", "symbolicAD.qwen_rules")
     def find_spec(self, fullname, path=None, target=None):
         if any(fullname == item or fullname.startswith(item + ".") for item in self.blocked):
             raise ImportError("validator intentionally blocked LLM module: " + fullname)
         return None
 
 sys.meta_path.insert(0, DenyLLM())
-import neurosymbolic_fsad.relational_inference
-from neurosymbolic_fsad.cable_relations import CableRelationalRuleEngine
+import symbolicAD.relational_inference
+from symbolicAD.cable_relations import CableRelationalRuleEngine
 engine = CableRelationalRuleEngine.load(sys.argv[1])
 score, evidence, facts, scene = engine.evaluate(sys.argv[2])
 loaded = sorted(name for name in sys.modules if (
     name == "transformers" or name.startswith("transformers.")
-    or name == "neurosymbolic_fsad.qwen_relations"
-    or name == "neurosymbolic_fsad.qwen_rules"
+    or name == "symbolicAD.qwen_relations"
+    or name == "symbolicAD.qwen_rules"
 ))
 print(json.dumps({
     "relational_score": score,
@@ -408,7 +408,7 @@ print(json.dumps({
 
 
 def _experiment_source_audit(repo_root: Path) -> Dict[str, Any]:
-    path = repo_root / "neurosymbolic_fsad" / "experiment_relational.py"
+    path = repo_root / "symbolicAD" / "experiment_relational.py"
     source = path.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(path))
     run_node = next(

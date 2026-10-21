@@ -23,8 +23,8 @@ PROJECT = Path(__file__).resolve().parent.parent
 if str(PROJECT) not in sys.path:
     sys.path.insert(0, str(PROJECT))
 
-from neurosymbolic_fsad.data import collect_test_samples
-from neurosymbolic_fsad.inpformer_adapter import (
+from symbolicAD.data import collect_test_samples
+from symbolicAD.inpformer_adapter import (
     DEFAULT_INPFORMER_ROOT,
     INPFormerAdapter,
     file_sha256,

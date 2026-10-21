@@ -17,12 +17,12 @@ PROJECT = Path(__file__).resolve().parent.parent
 if str(PROJECT) not in sys.path:
     sys.path.insert(0, str(PROJECT))
 
-from neurosymbolic_fsad.data import select_inpformer_support
-from neurosymbolic_fsad.qwen_generic_relations import (
+from symbolicAD.data import select_inpformer_support
+from symbolicAD.qwen_generic_relations import (
     QwenGenericRelationalProposer,
     consensus_generic_relational_proposals,
 )
-from neurosymbolic_fsad.qwen_relations import make_rgb_support_montage
+from symbolicAD.qwen_relations import make_rgb_support_montage
 
 
 def _dump(path: Path, payload) -> None:

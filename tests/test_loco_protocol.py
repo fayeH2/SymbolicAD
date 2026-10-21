@@ -2,8 +2,8 @@ from pathlib import Path
 
 import torch
 
-from neurosymbolic_fsad.data import select_inpformer_support
-from neurosymbolic_fsad.training_utils import loco_safe_augmentation
+from symbolicAD.data import select_inpformer_support
+from symbolicAD.training_utils import loco_safe_augmentation
 
 
 def test_mvtec_loco_support_excludes_flattened_validation(tmp_path: Path):

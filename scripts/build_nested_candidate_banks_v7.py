@@ -21,7 +21,7 @@ PROJECT = Path(__file__).resolve().parent.parent
 if str(PROJECT) not in sys.path:
     sys.path.insert(0, str(PROJECT))
 
-from neurosymbolic_fsad.qwen_logic_candidates import (
+from symbolicAD.qwen_logic_candidates import (
     SCHEMA_VERSION,
     aggregate_candidate_proposals,
     validate_logic_candidate,

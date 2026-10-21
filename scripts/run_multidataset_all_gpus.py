@@ -28,7 +28,7 @@ PROJECT = Path(__file__).resolve().parent.parent
 if str(PROJECT) not in sys.path:
     sys.path.insert(0, str(PROJECT))
 
-from neurosymbolic_fsad.data import IMAGE_SUFFIXES, select_inpformer_support
+from symbolicAD.data import IMAGE_SUFFIXES, select_inpformer_support
 
 
 DEFAULT_CONFIG = PROJECT / "configs" / "multidataset_v6.json"
@@ -498,7 +498,7 @@ def _class_specific_jobs(entries, args, defaults):
             source = output_root / "generic" / entry["id"] / class_name / f"k{args.shot}"
             cache = output_root / "cache" / entry["id"] / class_name / f"k{args.shot}"
             command = [
-                args.python, str(PROJECT / "run_class_specific_neurosymbolic_fsad.py"),
+                args.python, str(PROJECT / "run_class_specific_symbolicAD.py"),
                 "--dataset", entry["id"],
                 "--class-name", class_name,
                 "--data-root", entry["data_root"],
