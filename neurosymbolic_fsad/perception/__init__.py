@@ -1,6 +1,7 @@
 """Canonical perception interfaces for component and scene understanding."""
 
 from neurosymbolic_fsad.perception.segmentation import ComponentSegmenter, FallbackSegmenter
+from neurosymbolic_fsad.perception.sam_dino_segmenter import SamDinoSegmenter, SamDinoSegmenterWrapper, create_sam_dino_segmenter, SAMDinoConfig, DinoV2FeatureExtractor
 from neurosymbolic_fsad.perception.component_instances import (
     ComponentInstance, instances_from_binary_mask, instances_from_label_mask,
 )
@@ -17,6 +18,7 @@ from neurosymbolic_fsad.perception.spatial_alignment import (
 
 __all__ = [
     "ComponentSegmenter", "ComponentInstance", "FallbackSegmenter",
+    "SamDinoSegmenter", "SamDinoSegmenterWrapper", "create_sam_dino_segmenter", "SAMDinoConfig", "DinoV2FeatureExtractor",
     "instances_from_binary_mask", "instances_from_label_mask",
     "part_attributes", "measure_mask_shape",
     "SceneGraph", "SpatialRelation", "TopologicalRelation", "RelationEdge",

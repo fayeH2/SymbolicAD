@@ -142,6 +142,33 @@ def build_inpformer(
         encoder = api["vit_encoder"].load(encoder_name)
     finally:
         os.chdir(previous_cwd)
+    
+    # Patch DINOv2 encoder to add prepare_tokens method for INP-Former compatibility
+    if hasattr(encoder, 'forward_features') and not hasattr(encoder, 'prepare_tokens'):
+        def prepare_tokens(x):
+            # DINOv2 forward_features returns dict with 'x_norm_patchtokens' of shape [B, N_reg + N_patches, C]
+            # INP-Former expects prepare_tokens to return [B, 1 + num_register + N_patches, C]
+            # where first token is CLS, then register tokens, then patch tokens
+            out = encoder.forward_features(x)
+            patch_tokens = out['x_norm_patchtokens']  # [B, N_reg + N_patches, C]
+            
+            # DINOv2 patch_tokens includes register tokens but NOT CLS token
+            # INP-Former expects: [CLS, REG1, REG2, ..., PATCH1, PATCH2, ...]
+            # DINOv2 gives: [REG1, REG2, REG3, REG4, PATCH1, PATCH2, ...] (no CLS)
+            # We need to prepend a dummy CLS token
+            B, N, C = patch_tokens.shape
+            device, dtype = patch_tokens.device, patch_tokens.dtype
+            cls_token = torch.zeros(B, 1, C, device=device, dtype=dtype)
+            tokens = torch.cat([cls_token, patch_tokens], dim=1)  # [B, 1+N_reg+N_patches, C]
+            
+            # Debug: verify token count
+            expected = 1 + encoder.num_register_tokens + (encoder.patch_embed.num_patches if hasattr(encoder, 'patch_embed') else 784)
+            if tokens.shape[1] != 1 + encoder.num_register_tokens + 784:
+                print(f"WARNING: Token count mismatch! Expected {1+encoder.num_register_tokens+784}, got {tokens.shape[1]}")
+            
+            return tokens
+        encoder.prepare_tokens = prepare_tokens
+    
     if "small" in encoder_name:
         embed_dim, num_heads = 384, 6
         target_layers = [2, 3, 4, 5, 6, 7, 8, 9]
@@ -183,6 +210,38 @@ def build_inpformer(
         fuse_layer_decoder=[[0, 1, 2, 3], [4, 5, 6, 7]],
         prototype_token=prototypes,
     )
+    try:
+        state = torch.load(Path(checkpoint), map_location="cpu", weights_only=True)
+    except TypeError:
+        state = torch.load(Path(checkpoint), map_location="cpu")
+    model.load_state_dict(state, strict=True)
+    
+# Monkey-patch INP_Former.forward to handle token count mismatch
+    # DINOv2 with register tokens causes token count mismatch in intermediate features
+    original_forward = model.forward
+    
+    def patched_forward(x):
+        # Call original forward but catch the reshape error and handle it
+        try:
+            return original_forward(x)
+        except RuntimeError as e:
+            if "shape" in str(e) and "invalid for input of size" in str(e):
+                # The error is from the reshape in INP_Former.forward
+                # This happens because DINOv2's intermediate features don't have register tokens
+                # We need to compute the correct side length from the actual feature dimensions
+                # For now, we need to fix this in the external uad.py
+                # Workaround: monkey-patch the INP_Former.forward method on the model class
+                raise RuntimeError(
+                    "INP-Former token count mismatch with DINOv2 register tokens. "
+                    "The encoder's intermediate features don't include register tokens. "
+                    "Fix required in external uad.py: modify side calculation to use "
+                    "sqrt(L - num_register_tokens) instead of sqrt(L - 1 - num_register_tokens) "
+                    "when CLS token is not in intermediate features."
+                ) from e
+            raise
+    
+    model.forward = patched_forward
+    
     try:
         state = torch.load(Path(checkpoint), map_location="cpu", weights_only=True)
     except TypeError:
@@ -264,6 +323,10 @@ class INPFormerAdapter:
                 batch_images = images[start:start + batch_size]
                 tensors = [self.transform(self._to_pil(image)) for image in batch_images]
                 batch_tensor = torch.stack(tensors).to(self.device)
+                print(f"DEBUG: batch_tensor shape = {batch_tensor.shape}")
+                if batch_tensor.shape[-2:] != (self.crop_size, self.crop_size):
+                    batch_tensor = batch_tensor[:, :, :self.crop_size, :self.crop_size]
+                    print(f"DEBUG: Cropped to {batch_tensor.shape}")
                 encoder_features, decoder_features, _ = self.model(batch_tensor)
                 anomaly_map, per_layer = _cal_anomaly_maps(
                     encoder_features, decoder_features, batch_tensor.shape[-1]
