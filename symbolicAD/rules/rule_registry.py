@@ -56,9 +56,15 @@ class RuleRegistry:
 def default_rule_registry() -> RuleRegistry:
     """构造当前最小可信能力集；新增谓词必须在此显式接入执行器。"""
     from ..reasoning.predicate_executor import (
+        AboveExecutor,
+        AlignedVerticalExecutor,
         AspectRangeExecutor,
         ColorRangeExecutor,
         CountEqExecutor,
+        CountInExecutor,
+        DisjointExecutor,
+        ExistsExecutor,
+        LeftOfExecutor,
         LengthRangeExecutor,
     )
 
@@ -66,6 +72,16 @@ def default_rule_registry() -> RuleRegistry:
     registry.register(RuleCapability(
         "count_eq", CountEqExecutor(), ("instances", "observation_completeness"),
         "instance_mask_or_slot_probability",
+    ))
+    registry.register(RuleCapability(
+        "count_in", CountInExecutor(),
+        ("instances", "region_mask", "entity_count_completeness"),
+        "region_mask_and_instance_witness",
+    ))
+    registry.register(RuleCapability(
+        "exists", ExistsExecutor(),
+        ("instances", "region_mask", "entity_presence_completeness"),
+        "presence_region_mask",
     ))
     registry.register(RuleCapability(
         "length_range", LengthRangeExecutor(), ("instances", "length"),
@@ -78,6 +94,22 @@ def default_rule_registry() -> RuleRegistry:
     registry.register(RuleCapability(
         "color_range", ColorRangeExecutor(), ("instances", "color_h"),
         "instance_mask",
+    ))
+    registry.register(RuleCapability(
+        "above", AboveExecutor(), ("instances", "centroid"),
+        "relation_centroid",
+    ))
+    registry.register(RuleCapability(
+        "left_of", LeftOfExecutor(), ("instances", "centroid"),
+        "relation_centroid",
+    ))
+    registry.register(RuleCapability(
+        "aligned_vertical", AlignedVerticalExecutor(), ("instances", "centroid"),
+        "relation_centroid",
+    ))
+    registry.register(RuleCapability(
+        "disjoint", DisjointExecutor(), ("instances", "instance_mask_overlap"),
+        "relation_centroid",
     ))
     return registry
 

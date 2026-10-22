@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import random
+import subprocess
 import sys
 import time
 from functools import partial
@@ -67,6 +68,34 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _git_repository_state(path: Path) -> dict:
+    """Record baseline source provenance instead of assuming a clean checkout."""
+    def run(*arguments: str) -> str:
+        completed = subprocess.run(
+            ["git", "-C", str(path), *arguments], check=False,
+            capture_output=True, text=True,
+        )
+        return completed.stdout.strip() if completed.returncode == 0 else ""
+
+    commit = run("rev-parse", "HEAD")
+    status = run("status", "--porcelain", "--untracked-files=no")
+    tracked_sources = [
+        path / "models" / "uad.py",
+        path / "models" / "vit_encoder.py",
+        path / "models" / "vision_transformer.py",
+    ]
+    return {
+        "root": str(path),
+        "git_commit": commit or None,
+        "tracked_worktree_dirty": bool(status),
+        "tracked_status_porcelain": status.splitlines(),
+        "critical_source_sha256": {
+            str(source.relative_to(path)): _sha256(source)
+            for source in tracked_sources if source.is_file()
+        },
+    }
 
 
 def main() -> int:
@@ -289,6 +318,7 @@ def main() -> int:
         PROJECT / "symbolicAD" / "data.py",
         PROJECT / "symbolicAD" / "training_utils.py",
     ]
+    baseline_repository = _git_repository_state(inp_root)
     _dump(checkpoint.parent / "training_manifest.json", {
         "schema_version": "isolated-generic-inpformer-v2",
         "dataset": args.dataset,
@@ -321,7 +351,8 @@ def main() -> int:
         "source_sha256": {
             str(path.relative_to(PROJECT)): _sha256(path) for path in source_paths
         },
-        "baseline_repository_modified": False,
+        "baseline_repository_modified": baseline_repository["tracked_worktree_dirty"],
+        "baseline_repository": baseline_repository,
     })
     print(json.dumps({"status": "trained", "checkpoint": str(checkpoint)}))
     return 0

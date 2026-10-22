@@ -56,6 +56,10 @@ class SceneGraph:
     topological_relations: List[TopologicalRelation] = field(default_factory=list)
     relation_edges: List[RelationEdge] = field(default_factory=list)
     component_types: Dict[int, str] = field(default_factory=dict)
+    # ``type_hierarchy`` is part of the serialized visual fact contract.  A
+    # super-type (for example ``fruit``) expands only to explicitly declared
+    # children; executors never guess a hierarchy from names or prompts.
+    type_hierarchy: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
     global_context: Dict[str, Any] = field(default_factory=dict)
     grounding_confidence: float = 1.0
     observation_complete: bool = True
@@ -84,9 +88,20 @@ class SceneGraph:
         return str(self.component_types.get(index, getattr(component, "entity_type", "")))
 
     def instances_of(self, entity_type: str) -> List[Any]:
+        requested = str(entity_type)
+        accepted = {requested}
+        frontier = [requested]
+        # Expand recursively while guarding malformed cyclic ontologies.
+        while frontier:
+            parent = frontier.pop()
+            for child in self.type_hierarchy.get(parent, ()):
+                child = str(child)
+                if child not in accepted:
+                    accepted.add(child)
+                    frontier.append(child)
         return [
             component for index, component in enumerate(self.components)
-            if self.component_type(index) == entity_type
+            if self.component_type(index) in accepted
         ]
     
     def to_dict(self) -> Dict[str, Any]:
@@ -126,6 +141,9 @@ class SceneGraph:
                 for row in self.relation_edges
             ],
             "component_types": self.component_types,
+            "type_hierarchy": {
+                key: list(values) for key, values in self.type_hierarchy.items()
+            },
             "global_context": self.global_context,
             "grounding_confidence": self.grounding_confidence,
             "observation_complete": self.observation_complete,

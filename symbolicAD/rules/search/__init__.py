@@ -1,11 +1,17 @@
-"""Rule search package for SymbolicAD."""
+"""Typed, validation-driven rule search package."""
 
-from symbolicAD.rules.search.nsga2_search import (
-    RuleCandidate, SearchConfig, RuleValidator, RuleDependencyTracker,
-    ValidationDrivenSearch, run_validation_driven_search,
+from .symbolicdet_evolution import (
+    CounterfactualPair,
+    EvolutionaryRuleSearch,
+    RuleSetEvaluation,
+    SearchConfig,
+    SearchOutcome,
+    evaluate_rule_set,
+    exhaustive_rule_search,
 )
 
 __all__ = [
-    "RuleCandidate", "SearchConfig", "RuleValidator", "RuleDependencyTracker",
-    "ValidationDrivenSearch", "run_validation_driven_search",
+    "CounterfactualPair", "EvolutionaryRuleSearch", "RuleSetEvaluation",
+    "SearchConfig", "SearchOutcome", "evaluate_rule_set",
+    "exhaustive_rule_search",
 ]

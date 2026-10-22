@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Leakage-free image-level evaluation for a trained MVTec LOCO checkpoint.
 
-The official LOCO localization metric is sPRO@5% FPR.  The flattened local
-copy does not contain the official defect configuration required to reproduce
-that metric, so this evaluator deliberately reports only defensible image
-metrics.  Logical and structural subsets each reuse all good test images.
+This command deliberately owns only image AUROC/AP.  Localization is evaluated
+by the frame-aware sPRO pipeline, because INP center-crop maps and full-image
+rule maps must first be projected into a common original-image frame.
 """
 
 from __future__ import annotations
@@ -89,6 +88,10 @@ def main() -> int:
     parser.add_argument("--input-size", type=int, default=448)
     parser.add_argument("--crop-size", type=int, default=392)
     parser.add_argument("--map-size", type=int, default=256)
+    parser.add_argument(
+        "--classes", nargs="+", choices=LOCO_CLASSES, default=list(LOCO_CLASSES),
+        help="Evaluate only the classes on which this checkpoint was trained.",
+    )
     args = parser.parse_args()
 
     data_root = Path(args.data_root).expanduser().resolve()
@@ -103,7 +106,8 @@ def main() -> int:
     checkpoint_metadata = adapter.cache_metadata()
     class_metrics: Dict[str, object] = {}
     detail_rows: List[Dict[str, object]] = []
-    for class_name in LOCO_CLASSES:
+    selected_classes = tuple(args.classes)
+    for class_name in selected_classes:
         samples = collect_test_samples(data_root / class_name)
         paths = [Path(row["path"]) for row in samples]
         identifiers = [str(path.resolve()) for path in paths]
@@ -140,7 +144,7 @@ def main() -> int:
     macro = {
         group: {
             metric: float(np.mean([
-                class_metrics[name][group][metric] for name in LOCO_CLASSES
+                class_metrics[name][group][metric] for name in selected_classes
             ]))
             for metric in ("image_auroc", "image_ap")
         }
@@ -152,10 +156,7 @@ def main() -> int:
         "checkpoint_sha256": file_sha256(checkpoint),
         "metric_scope": "image-level only",
         "official_spro_computed": False,
-        "official_spro_reason": (
-            "formatted dataset lacks the official defect configuration; do not "
-            "substitute global pixel AUROC for sPRO@5%FPR"
-        ),
+        "official_spro_reason": "computed separately after explicit map-frame projection",
         "subset_policy": "each anomaly family plus all good test images",
         "per_class": class_metrics,
         "macro": macro,

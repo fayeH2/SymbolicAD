@@ -16,6 +16,12 @@ from typing import Any, Dict, Iterable, Mapping, Tuple
 class PredicateKind(str, Enum):
     """受控谓词名称；枚举存在不等于已经具有 executor。"""
     COUNT_EQ = "count_eq"
+    COUNT_IN = "count_in"
+    EXISTS = "exists"
+    ABOVE = "above"
+    LEFT_OF = "left_of"
+    ALIGNED_VERTICAL = "aligned_vertical"
+    DISJOINT = "disjoint"
     LENGTH_RANGE = "length_range"
     ASPECT_RANGE = "aspect_range"
     COLOR_RANGE = "color_range"
