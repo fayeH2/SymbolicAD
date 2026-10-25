@@ -16,6 +16,7 @@ GT 只允许进入本评价模块；任何推理 API 都不接收 GT mask，从�
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
 import cv2
@@ -109,6 +110,22 @@ class SproCurve:
     region_count: int
 
 
+class MapFrame(str, Enum):
+    """Coordinate frame carried by an anomaly map; array size is not a frame."""
+
+    ORIGINAL = "original"
+    FULL_IMAGE_NORMALIZED = "full_image_normalized"
+    MODEL_CENTER_CROP = "model_center_crop"
+
+
+@dataclass(frozen=True)
+class ScoreMapGeometry:
+    frame: MapFrame
+    input_size: int = 448
+    crop_size: int = 392
+    outside_value: float = 0.0
+
+
 def _regions(
     category: str,
     ground_truth: np.ndarray,
@@ -139,15 +156,68 @@ def _regions(
     return tuple(result)
 
 
-def _resize_score_map(score_map: np.ndarray, shape: Tuple[int, int]) -> np.ndarray:
+def project_score_map_to_original(
+    score_map: np.ndarray,
+    shape: Tuple[int, int],
+    geometry: Optional[ScoreMapGeometry] = None,
+) -> np.ndarray:
+    """Project a declared map frame to raw-image coordinates.
+
+    A resized map with missing geometry fails closed.  This prevents a
+    center-crop INP map from being silently stretched over pixels the model
+    never observed, and prevents direct fusion with full-image rule maps.
+    """
     values = np.asarray(score_map, dtype=np.float32)
     if values.ndim != 2:
         raise ValueError("anomaly maps must be two-dimensional")
-    if values.shape != shape:
-        values = cv2.resize(values, shape[::-1], interpolation=cv2.INTER_LINEAR)
     if not np.isfinite(values).all():
         raise ValueError("anomaly maps must contain only finite values")
-    return values
+    if geometry is None:
+        if values.shape != shape:
+            raise ValueError(
+                "map geometry is required when map and original shapes differ"
+            )
+        geometry = ScoreMapGeometry(MapFrame.ORIGINAL)
+    frame = MapFrame(geometry.frame)
+    if frame == MapFrame.ORIGINAL:
+        if values.shape != shape:
+            raise ValueError("ORIGINAL-frame map shape must equal ground truth shape")
+        return values
+    if frame == MapFrame.FULL_IMAGE_NORMALIZED:
+        return cv2.resize(values, shape[::-1], interpolation=cv2.INTER_LINEAR)
+    if frame != MapFrame.MODEL_CENTER_CROP:
+        raise ValueError(f"unsupported map frame: {frame}")
+    input_size = int(geometry.input_size)
+    crop_size = int(geometry.crop_size)
+    if input_size <= 0 or crop_size <= 0 or crop_size > input_size:
+        raise ValueError("center-crop geometry must satisfy 0 < crop <= input")
+    offset = (input_size - crop_size) // 2
+    if offset * 2 + crop_size != input_size:
+        raise ValueError("center-crop inverse currently requires symmetric integer padding")
+    crop = cv2.resize(values, (crop_size, crop_size), interpolation=cv2.INTER_LINEAR)
+    canvas = np.full(
+        (input_size, input_size), float(geometry.outside_value), dtype=np.float32
+    )
+    canvas[offset:offset + crop_size, offset:offset + crop_size] = crop
+    valid = np.zeros((input_size, input_size), dtype=np.uint8)
+    valid[offset:offset + crop_size, offset:offset + crop_size] = 1
+    restored = cv2.resize(canvas, shape[::-1], interpolation=cv2.INTER_LINEAR)
+    restored_valid = cv2.resize(valid, shape[::-1], interpolation=cv2.INTER_NEAREST)
+    restored[restored_valid == 0] = float(geometry.outside_value)
+    return restored
+
+
+def fuse_in_original_frame(
+    left: np.ndarray,
+    left_geometry: ScoreMapGeometry,
+    right: np.ndarray,
+    right_geometry: ScoreMapGeometry,
+    shape: Tuple[int, int],
+) -> np.ndarray:
+    """Probability-OR fusion after, never before, coordinate projection."""
+    lhs = np.clip(project_score_map_to_original(left, shape, left_geometry), 0.0, 1.0)
+    rhs = np.clip(project_score_map_to_original(right, shape, right_geometry), 0.0, 1.0)
+    return (1.0 - (1.0 - lhs) * (1.0 - rhs)).astype(np.float32)
 
 
 def _curve_thresholds(normal_scores: np.ndarray, maximum_fpr: float, count: int) -> np.ndarray:
@@ -166,6 +236,61 @@ def _curve_thresholds(normal_scores: np.ndarray, maximum_fpr: float, count: int)
     ]))[::-1]
 
 
+def _strict_counts_above(values: np.ndarray, thresholds: np.ndarray) -> np.ndarray:
+    """Count ``value > threshold`` for all ascending thresholds in one pass."""
+    thresholds = np.asarray(thresholds, dtype=np.float32)
+    if thresholds.ndim != 1 or np.any(thresholds[1:] < thresholds[:-1]):
+        raise ValueError("thresholds must be a one-dimensional ascending array")
+    flat = np.asarray(values, dtype=np.float32).ravel()
+    ranks = np.searchsorted(thresholds, flat, side="left")
+    histogram = np.bincount(ranks, minlength=len(thresholds) + 1)
+    suffix = np.cumsum(histogram[::-1], dtype=np.int64)[::-1]
+    return suffix[1:]
+
+
+def _upper_tail_thresholds(
+    samples: Sequence[LocoEvaluationSample],
+    map_name: str,
+    geometry: Optional[ScoreMapGeometry],
+    maximum_fpr: float,
+    count: int,
+) -> Tuple[np.ndarray, int]:
+    """Collect exactly the global upper FPR tail without materializing all pixels."""
+    negative_count = int(sum(
+        np.count_nonzero(np.asarray(sample.ground_truth)[..., 0] == 0)
+        if np.asarray(sample.ground_truth).ndim == 3
+        else np.count_nonzero(np.asarray(sample.ground_truth) == 0)
+        for sample in samples
+    ))
+    if negative_count <= 0:
+        raise ValueError("no non-defect pixels available for FPR")
+    first_rank = int(np.ceil((1.0 - maximum_fpr) * (negative_count - 1)))
+    keep_count = negative_count - first_rank
+    tail = np.empty(0, dtype=np.float32)
+    for sample in samples:
+        gt = np.asarray(sample.ground_truth)
+        if gt.ndim == 3:
+            gt = gt[..., 0]
+        score = project_score_map_to_original(
+            sample.maps[map_name], gt.shape, geometry
+        )
+        tail = np.concatenate((tail, score[gt == 0].astype(np.float32, copy=False)))
+        if tail.size > keep_count:
+            boundary = tail.size - keep_count
+            tail = np.partition(tail, boundary)[boundary:]
+    tail.sort()
+    quantiles = np.linspace(1.0, 1.0 - maximum_fpr, max(int(count), 2))
+    global_ranks = np.ceil(quantiles * (negative_count - 1)).astype(np.int64)
+    local_ranks = np.clip(global_ranks - first_rank, 0, tail.size - 1)
+    values = tail[local_ranks]
+    thresholds = np.unique(np.concatenate((
+        values,
+        [np.nextafter(tail[-1], np.float32(np.inf))],
+        [np.nextafter(tail[0], np.float32(-np.inf))],
+    )).astype(np.float32))
+    return thresholds, negative_count
+
+
 def evaluate_spro(
     samples: Sequence[LocoEvaluationSample],
     map_name: str,
@@ -174,6 +299,7 @@ def evaluate_spro(
     maximum_fpr: float = 0.05,
     threshold_count: int = 1000,
     saturation_table: Mapping[str, Mapping[int, SaturationSpec]] = DEFAULT_SATURATION_TABLE,
+    geometry: Optional[ScoreMapGeometry] = None,
 ) -> SproCurve:
     """在 good + 指定异常类型子集上评价一个 map family。"""
     if anomaly_type not in {"logical", "structural"}:
@@ -185,45 +311,37 @@ def evaluate_spro(
     ]
     if not subset:
         raise ValueError("evaluation subset is empty")
-    prepared = []
-    all_regions = []
-    normal_pixels = []
+    region_count = 0
     for sample in subset:
         gt = np.asarray(sample.ground_truth)
         if gt.ndim == 3:
             gt = gt[..., 0]
         if map_name not in sample.maps:
             raise KeyError(f"sample {sample.sample_id} has no map {map_name!r}")
-        score = _resize_score_map(sample.maps[map_name], gt.shape)
-        regions = (
-            tuple() if sample.anomaly_type == "good"
-            else _regions(sample.category, gt, saturation_table)
-        )
-        prepared.append((score, gt > 0, regions))
-        all_regions.extend((score, mask, saturation) for mask, saturation in regions)
-        normal_pixels.append(score[gt == 0])
-    if not all_regions:
+        if sample.anomaly_type != "good":
+            region_count += len(_regions(sample.category, gt, saturation_table))
+    if not region_count:
         raise ValueError(f"no {anomaly_type} GT regions were found")
-    negatives = np.concatenate(normal_pixels)
-    if not negatives.size:
-        raise ValueError("no non-defect pixels available for FPR")
-    thresholds = _curve_thresholds(negatives, maximum_fpr, threshold_count)
-    fprs, overlaps = [], []
-    negative_count = float(negatives.size)
-    for threshold in thresholds:
-        false_positives = sum(
-            int(np.count_nonzero((score > threshold) & ~defect_mask))
-            for score, defect_mask, _ in prepared
+    thresholds, negative_count = _upper_tail_thresholds(
+        subset, map_name, geometry, maximum_fpr, threshold_count
+    )
+    false_positives = np.zeros(len(thresholds), dtype=np.int64)
+    overlap_sum = np.zeros(len(thresholds), dtype=np.float64)
+    for sample in subset:
+        gt = np.asarray(sample.ground_truth)
+        if gt.ndim == 3:
+            gt = gt[..., 0]
+        score = project_score_map_to_original(
+            sample.maps[map_name], gt.shape, geometry
         )
-        fpr = false_positives / negative_count
-        spro = float(np.mean([
-            min(float(np.count_nonzero((score > threshold) & region)) / saturation, 1.0)
-            for score, region, saturation in all_regions
-        ]))
-        fprs.append(fpr)
-        overlaps.append(spro)
-    fprs = np.asarray(fprs, dtype=float)
-    overlaps = np.asarray(overlaps, dtype=float)
+        false_positives += _strict_counts_above(score[gt == 0], thresholds)
+        if sample.anomaly_type == "good":
+            continue
+        for region, saturation in _regions(sample.category, gt, saturation_table):
+            hits = _strict_counts_above(score[region], thresholds)
+            overlap_sum += np.minimum(hits.astype(np.float64) / saturation, 1.0)
+    fprs = false_positives.astype(np.float64) / float(negative_count)
+    overlaps = overlap_sum / float(region_count)
     order = np.argsort(fprs, kind="stable")
     fprs, overlaps = fprs[order], overlaps[order]
     # Collapse duplicate FPRs conservatively to their best achievable sPRO.
@@ -239,10 +357,11 @@ def evaluate_spro(
         keep = unique_fpr < maximum_fpr
         unique_fpr = np.append(unique_fpr[keep], maximum_fpr)
         unique_overlap = np.append(unique_overlap[keep], boundary)
-    area = float(np.trapz(unique_overlap, unique_fpr) / maximum_fpr)
+    trapezoid = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
+    area = float(trapezoid(unique_overlap, unique_fpr) / maximum_fpr)
     return SproCurve(
         unique_fpr.astype(np.float32), unique_overlap.astype(np.float32),
-        float(np.clip(area, 0.0, 1.0)), maximum_fpr, len(all_regions),
+        float(np.clip(area, 0.0, 1.0)), maximum_fpr, region_count,
     )
 
 
@@ -252,6 +371,7 @@ def evaluate_map_families(
     maximum_fpr: float = 0.05,
     threshold_count: int = 1000,
     saturation_table: Mapping[str, Mapping[int, SaturationSpec]] = DEFAULT_SATURATION_TABLE,
+    map_geometries: Optional[Mapping[str, ScoreMapGeometry]] = None,
 ) -> Dict[str, Dict[str, float]]:
     """用同一协议分别评价逐规则图、总逻辑图和最终融合图。"""
     names = sorted({name for sample in samples for name in sample.maps})
@@ -260,10 +380,12 @@ def evaluate_map_families(
         logical = evaluate_spro(
             samples, name, "logical", maximum_fpr=maximum_fpr,
             threshold_count=threshold_count, saturation_table=saturation_table,
+            geometry=None if map_geometries is None else map_geometries.get(name),
         )
         structural = evaluate_spro(
             samples, name, "structural", maximum_fpr=maximum_fpr,
             threshold_count=threshold_count, saturation_table=saturation_table,
+            geometry=None if map_geometries is None else map_geometries.get(name),
         )
         output[name] = {
             "logical_spro_5fpr": logical.normalized_area,
@@ -279,5 +401,7 @@ def evaluate_map_families(
 
 __all__ = [
     "SaturationSpec", "DEFAULT_SATURATION_TABLE", "LocoEvaluationSample",
-    "SproCurve", "evaluate_spro", "evaluate_map_families",
+    "SproCurve", "MapFrame", "ScoreMapGeometry",
+    "project_score_map_to_original", "fuse_in_original_frame",
+    "evaluate_spro", "evaluate_map_families",
 ]

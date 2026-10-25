@@ -156,8 +156,13 @@ def _worker_extract(args: Tuple[int, str]) -> Tuple[int, Dict[str, Any]]:
     return index, _WORKER_BUILDER.extract(path)
 
 
+CACHE_SCHEMA_VERSION = "detection-record-v2"
+
+
 def _cache_path(cache_dir: Path, path: Path) -> Path:
-    return cache_dir / f"{sha256_file(path)}.json"
+    # The version prefix invalidates records produced by an older geometry or
+    # detector configuration instead of silently mixing conventions.
+    return cache_dir / f"{CACHE_SCHEMA_VERSION}-{sha256_file(path)}.json"
 
 
 def detect_split(

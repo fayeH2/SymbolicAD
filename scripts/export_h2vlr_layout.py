@@ -142,7 +142,9 @@ def _histogram_auc(positive: np.ndarray, negative: np.ndarray) -> float | None:
     fpr = np.concatenate(([0.0], np.cumsum(negative[::-1]) / neg_total, [1.0]))
     # NumPy 2 prefers ``trapezoid`` while the older H2VLR environment only
     # provides ``trapz``.  They implement the same composite trapezoidal rule.
-    integrate = getattr(np, "trapezoid", np.trapz)
+    # ``getattr(..., np.trapz)`` eagerly evaluates the default, which raises
+    # on NumPy 2 where ``trapz`` was removed even though ``trapezoid`` exists.
+    integrate = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
     return float(integrate(tpr, fpr))
 
 

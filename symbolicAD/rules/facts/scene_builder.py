@@ -56,7 +56,9 @@ class SceneFactConfig:
     supertypes: Mapping[str, Tuple[str, ...]] = field(
         default_factory=lambda: dict(DEFAULT_SUPERTYPES)
     )
-    divider_search_fraction: Tuple[float, float] = (0.25, 0.75)
+    # 固定机位下托盘隔板在中线附近；收窄搜索带可避免把托盘内壁或
+    # 水果边缘误当成隔板（宽搜索带曾在 1/3 图上把隔板估到 0.25/0.73）。
+    divider_search_fraction: Tuple[float, float] = (0.44, 0.56)
     min_objects: int = 1
     map_size: int = 128
 
@@ -64,7 +66,7 @@ class SceneFactConfig:
 def estimate_vertical_divider(
     gray: np.ndarray,
     container_box: Tuple[float, float, float, float],
-    search_fraction: Tuple[float, float] = (0.25, 0.75),
+    search_fraction: Tuple[float, float] = (0.44, 0.56),
 ) -> Tuple[int, float]:
     """在容器中部搜索贯穿性的竖直分隔线，返回 ``(x_pixel, 相对位置)``。"""
 
@@ -77,7 +79,10 @@ def estimate_vertical_divider(
     gradient = np.abs(cv2.Sobel(gray.astype(np.float32), cv2.CV_32F, 1, 0, ksize=3))
     column = gradient[rows].mean(axis=0)
     if column.size >= 21:
-        column = cv2.GaussianBlur(column.reshape(1, -1), (1, 21), 0).ravel()
+        # ``column`` is a 1 x W signal: smooth along W.  The historical
+        # (1, 21) kernel smoothed a non-existent vertical dimension and left
+        # object edges sharp enough to be mistaken for the divider.
+        column = cv2.GaussianBlur(column.reshape(1, -1), (21, 1), 0).ravel()
     segment = column[lower:upper]
     divider = (
         int((x0 + x1) / 2.0) if segment.size == 0
@@ -367,6 +372,9 @@ class SceneFactBuilder:
             "num_object_detections": len(objects),
             "rejected_detections": [dict(row) for row in batch.rejected],
             "detector": "groundingdino_swint_ogc",
+            # Executor maps are resized from masks defined on the complete raw
+            # image.  They are not in the INP center-crop coordinate frame.
+            "map_frame": "full_image_normalized",
             "edited_image": bool(edited),
         }
         if intervention is not None:

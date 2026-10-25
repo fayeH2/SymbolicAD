@@ -393,7 +393,8 @@ class INPFormerAdapter:
             "input_size": self.input_size,
             "crop_size": self.crop_size,
             "map_size": self.map_size,
-            "cache_schema": 2,
+            "map_frame": "model_center_crop",
+            "cache_schema": 3,
         }
 
     def close(self) -> None:

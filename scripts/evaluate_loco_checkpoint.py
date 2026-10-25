@@ -160,6 +160,22 @@ def main() -> int:
         "subset_policy": "each anomaly family plus all good test images",
         "per_class": class_metrics,
         "macro": macro,
+        "quality_gate": {
+            "metric": "all.image_auroc",
+            "threshold": 0.80,
+            "per_class_pass": {
+                name: bool(class_metrics[name]["all"]["image_auroc"] >= 0.80)
+                for name in selected_classes
+            },
+            "all_classes_pass": bool(all(
+                class_metrics[name]["all"]["image_auroc"] >= 0.80
+                for name in selected_classes
+            )),
+            "note": (
+                "This gate applies only to image AUROC; pixel AP and "
+                "sPRO@5%FPR are reported separately and are not rescaled."
+            ),
+        },
     }
     _dump(output / "metrics.json", result)
     with (output / "predictions.csv").open("w", encoding="utf-8", newline="") as handle:
