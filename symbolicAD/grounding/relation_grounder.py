@@ -139,6 +139,7 @@ def _evaluate_count_eq(
             "estimated_count": estimated,
             "target": target,
             "mode": "excess",
+            "missing": False,
             "extra_instances": [item.instance_id for item in extra],
         }
     elif estimated < target - 0.25:
@@ -151,6 +152,7 @@ def _evaluate_count_eq(
             "estimated_count": estimated,
             "target": target,
             "mode": "missing",
+            "missing": True,
             "missing_expected_mass": float(responsibility.sum()),
         }
     else:
@@ -199,6 +201,7 @@ def _evaluate_count_ratio(
             "ratio": ratio,
             "target": target,
             "mode": mode,
+            "missing": mode == "a_missing_or_b_excess",
         },
     )
 
