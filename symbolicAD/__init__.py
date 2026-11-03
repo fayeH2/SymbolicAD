@@ -1,9 +1,11 @@
-"""SymbolicAD: Neuro-Symbolic Few-Shot Anomaly Detection Package."""
+"""SymbolicAD V3.2: staged neuro-symbolic anomaly detection.
 
-from .inpformer_adapter import INPFormerAdapter, build_inpformer
+The package is organised around a "run first, then verify and replace"
+principle.  Stage one produces baseline / logic / final anomaly maps and
+metrics; every intermediate artefact is kept on disk for diagnosis.
+"""
 
-__version__ = "1.0.0"
-__all__ = [
-    "INPFormerAdapter",
-    "build_inpformer",
-]
+from .config import Config, load_config
+
+__all__ = ["Config", "load_config"]
+__version__ = "3.2.0"

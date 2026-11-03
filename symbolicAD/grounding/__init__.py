@@ -1,14 +1,29 @@
-"""正式空间归因接口；GT mask 只允许在 evaluation 包中出现。"""
+"""Component grounding: semantic maps, instances, support memory."""
 
-from .counterfactual_repair import RepairMap, length_endpoint_repair
-from .instance_grounder import InstanceGrounder, InstanceGrounding
-from .relation_grounder import relation_witness_map
-from .shape_grounder import length_violation_map, resized_instance_mask, union_instance_masks
-from .slot_grounder import SlotGrounder, SlotPrototype
+from .scene_graph import ComponentInstance, SceneGraph
+from .component_maps import build_component_maps, normalize_with_support
+from .instance_extractor import extract_instances
+from .support_memory import (
+    ComponentMemory,
+    RelationMemory,
+    SupportMemory,
+    build_support_memory,
+    load_support_memory,
+    save_support_memory,
+)
+from .relation_grounder import evaluate_atoms
 
 __all__ = [
-    "RepairMap", "length_endpoint_repair", "InstanceGrounder",
-    "InstanceGrounding", "relation_witness_map", "length_violation_map",
-    "resized_instance_mask", "union_instance_masks", "SlotGrounder",
-    "SlotPrototype",
+    "ComponentInstance",
+    "SceneGraph",
+    "build_component_maps",
+    "normalize_with_support",
+    "extract_instances",
+    "ComponentMemory",
+    "RelationMemory",
+    "SupportMemory",
+    "build_support_memory",
+    "load_support_memory",
+    "save_support_memory",
+    "evaluate_atoms",
 ]
