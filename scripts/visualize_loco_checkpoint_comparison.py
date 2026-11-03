@@ -301,8 +301,13 @@ def _plot_examples(
     )
     fig.suptitle(
         "Representative LOCO anomaly-map comparison",
-        fontsize=16, fontweight="bold", y=1.006,
+        fontsize=16, fontweight="bold", y=0.995,
     )
+    # Reserve a real title band; otherwise constrained_layout can place the
+    # suptitle on top of the five column headers for a single-class figure.
+    layout_engine = fig.get_layout_engine()
+    if layout_engine is not None:
+        layout_engine.set(rect=(0.0, 0.0, 1.0, 0.965))
     fig.savefig(output, dpi=160, facecolor="white")
     plt.close(fig)
     manifest_path.write_text(

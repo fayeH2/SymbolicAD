@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Sequence
 
 import numpy as np
+from PIL import Image
 from sklearn.metrics import average_precision_score, roc_auc_score
 
 PROJECT = Path(__file__).resolve().parent.parent
@@ -29,6 +30,9 @@ from symbolicAD.inpformer_adapter import (
     file_sha256,
     load_prediction_cache,
     save_prediction_cache,
+)
+from symbolicAD.evaluation.spro import (
+    LocoEvaluationSample, MapFrame, ScoreMapGeometry, evaluate_spro,
 )
 
 
@@ -75,6 +79,20 @@ def _dump(path: Path, value: object) -> None:
     )
 
 
+def _loco_ground_truth(image_path: Path, defect_type: str) -> np.ndarray:
+    if defect_type.lower() in {"good", "ok"}:
+        with Image.open(image_path) as image:
+            width, height = image.size
+        return np.zeros((height, width), dtype=np.uint8)
+    candidate = (
+        image_path.parents[2] / "ground_truth" / defect_type
+        / f"{image_path.stem}_mask.png"
+    )
+    if not candidate.is_file():
+        raise FileNotFoundError(candidate)
+    return np.asarray(Image.open(candidate).convert("L"), dtype=np.uint8)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-root", required=True)
@@ -92,6 +110,8 @@ def main() -> int:
         "--classes", nargs="+", choices=LOCO_CLASSES, default=list(LOCO_CLASSES),
         help="Evaluate only the classes on which this checkpoint was trained.",
     )
+    parser.add_argument("--compute-spro", action="store_true")
+    parser.add_argument("--spro-thresholds", type=int, default=1000)
     args = parser.parse_args()
 
     data_root = Path(args.data_root).expanduser().resolve()
@@ -105,6 +125,8 @@ def main() -> int:
     )
     checkpoint_metadata = adapter.cache_metadata()
     class_metrics: Dict[str, object] = {}
+    localization_metrics: Dict[str, object] = {}
+    spro_curve_arrays: Dict[str, np.ndarray] = {}
     detail_rows: List[Dict[str, object]] = []
     selected_classes = tuple(args.classes)
     for class_name in selected_classes:
@@ -131,6 +153,45 @@ def main() -> int:
             indices = defect_group_indices(samples, group)
             groups[group] = binary_metrics(labels[indices], scores[indices])
         class_metrics[class_name] = groups
+        if args.compute_spro:
+            evaluation_samples = []
+            for sample, score_map in zip(samples, predictions["maps"]):
+                path = Path(sample["path"]).resolve()
+                defect = str(sample["defect_type"])
+                family = (
+                    "good" if defect.lower() in {"good", "ok"}
+                    else "logical" if "logical" in defect.lower()
+                    else "structural"
+                )
+                evaluation_samples.append(LocoEvaluationSample(
+                    sample_id=str(path), category=class_name,
+                    anomaly_type=family,
+                    ground_truth=_loco_ground_truth(path, defect),
+                    maps={"inp": np.asarray(score_map, dtype=np.float32)},
+                ))
+            geometry = ScoreMapGeometry(
+                MapFrame.MODEL_CENTER_CROP,
+                input_size=args.input_size, crop_size=args.crop_size,
+            )
+            class_localization = {}
+            for family in ("logical", "structural"):
+                curve = evaluate_spro(
+                    evaluation_samples, "inp", family,
+                    threshold_count=args.spro_thresholds, geometry=geometry,
+                )
+                class_localization[f"{family}_spro_5fpr"] = curve.normalized_area
+                class_localization[f"{family}_region_count"] = curve.region_count
+                spro_curve_arrays[f"{class_name}__{family}__fpr"] = (
+                    curve.false_positive_rates
+                )
+                spro_curve_arrays[f"{class_name}__{family}__spro"] = (
+                    curve.saturated_overlaps
+                )
+            class_localization["mean_spro_5fpr"] = float(np.mean([
+                class_localization["logical_spro_5fpr"],
+                class_localization["structural_spro_5fpr"],
+            ]))
+            localization_metrics[class_name] = class_localization
         for sample, score in zip(samples, scores):
             detail_rows.append({
                 "class_name": class_name,
@@ -154,12 +215,34 @@ def main() -> int:
         "schema": "mvtec-loco-image-evaluation-v1",
         "checkpoint": str(checkpoint),
         "checkpoint_sha256": file_sha256(checkpoint),
-        "metric_scope": "image-level only",
+        "evaluation_config": {
+            "dataset": "mvtec_loco",
+            "classes": list(selected_classes),
+            "encoder": args.encoder,
+            "inp_num": args.inp_num,
+            "input_size": args.input_size,
+            "crop_size": args.crop_size,
+            "map_size": args.map_size,
+            "batch_size": args.batch_size,
+            "compute_spro": bool(args.compute_spro),
+            "spro_threshold_count": args.spro_thresholds,
+            "inp_map_frame": MapFrame.MODEL_CENTER_CROP.value,
+            "maximum_false_positive_rate": 0.05,
+        },
+        "metric_scope": (
+            "image AUROC/AP plus project frame-aware paper-table sPRO reproduction"
+            if args.compute_spro else "image-level only"
+        ),
         "official_spro_computed": False,
-        "official_spro_reason": "computed separately after explicit map-frame projection",
+        "official_spro_reason": (
+            "project implementation uses the published saturation tables and "
+            "5% FPR protocol; numerical parity with the official evaluation "
+            "package has not yet been certified"
+        ),
         "subset_policy": "each anomaly family plus all good test images",
         "per_class": class_metrics,
         "macro": macro,
+        "localization": localization_metrics,
         "quality_gate": {
             "metric": "all.image_auroc",
             "threshold": 0.80,
@@ -178,6 +261,8 @@ def main() -> int:
         },
     }
     _dump(output / "metrics.json", result)
+    if spro_curve_arrays:
+        np.savez_compressed(output / "spro_curves.npz", **spro_curve_arrays)
     with (output / "predictions.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(detail_rows[0]))
         writer.writeheader()

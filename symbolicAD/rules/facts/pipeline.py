@@ -20,8 +20,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -159,10 +161,68 @@ def _worker_extract(args: Tuple[int, str]) -> Tuple[int, Dict[str, Any]]:
 CACHE_SCHEMA_VERSION = "detection-record-v2"
 
 
-def _cache_path(cache_dir: Path, path: Path) -> Path:
-    # The version prefix invalidates records produced by an older geometry or
-    # detector configuration instead of silently mixing conventions.
-    return cache_dir / f"{CACHE_SCHEMA_VERSION}-{sha256_file(path)}.json"
+@lru_cache(maxsize=32)
+def _cached_sha256(path: str) -> str:
+    return sha256_file(path)
+
+
+def detector_cache_fingerprint(
+    vocabulary_payload: Optional[Mapping[str, Sequence[str]]],
+) -> str:
+    """Fingerprint the complete fixed perception configuration.
+
+    Image bytes alone are insufficient for a detection cache key: changing
+    vocabulary, thresholds, weights or extraction code changes the facts.
+    """
+    from . import open_vocab
+
+    source_paths = (
+        Path(__file__).resolve(),
+        Path(open_vocab.__file__).resolve(),
+        Path(__file__).with_name("scene_builder.py").resolve(),
+    )
+    artifact_paths = (
+        Path(open_vocab._DINO_CONFIG).resolve(),
+        Path(open_vocab._DINO_WEIGHTS).resolve(),
+        Path(open_vocab._DINO_BERT).resolve() / "config.json",
+        Path(open_vocab._DINO_BERT).resolve() / "vocab.txt",
+    )
+    missing = [str(path) for path in artifact_paths if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"detector provenance artifact missing: {missing}")
+    payload = {
+        "schema": CACHE_SCHEMA_VERSION,
+        "vocabulary": {
+            str(key): list(value)
+            for key, value in sorted((vocabulary_payload or {}).items())
+        },
+        "detector_defaults": {
+            "box_threshold": 0.25,
+            "text_threshold": 0.25,
+            "nms_iou": 0.55,
+            "min_image_area_fraction": 1e-4,
+            "max_image_area_fraction": 0.6,
+            "image_short_side": 800,
+            "image_max_side": 1333,
+        },
+        "artifact_sha256": {
+            str(path): _cached_sha256(str(path)) for path in artifact_paths
+        },
+        "source_sha256": {
+            str(path): _cached_sha256(str(path)) for path in source_paths
+        },
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _cache_path(cache_dir: Path, path: Path, detector_fingerprint: str) -> Path:
+    return cache_dir / (
+        f"{CACHE_SCHEMA_VERSION}-{detector_fingerprint[:20]}-"
+        f"{sha256_file(path)}.json"
+    )
 
 
 def detect_split(
@@ -181,10 +241,11 @@ def detect_split(
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     resolved = [str(Path(path).resolve()) for path in paths]
+    detector_fingerprint = detector_cache_fingerprint(vocabulary_payload)
     records: Dict[str, Dict[str, Any]] = {}
     missing: List[Tuple[int, str]] = []
     for index, path in enumerate(resolved):
-        cached = _cache_path(cache_dir, Path(path))
+        cached = _cache_path(cache_dir, Path(path), detector_fingerprint)
         if cached.is_file():
             records[path] = json.loads(cached.read_text(encoding="utf-8"))
         else:
@@ -224,7 +285,7 @@ def detect_split(
         for index, record in rows:
             path = resolved[index]
             records[path] = record
-            _cache_path(cache_dir, Path(path)).write_text(
+            _cache_path(cache_dir, Path(path), detector_fingerprint).write_text(
                 json.dumps(record, ensure_ascii=False), encoding="utf-8"
             )
             completed += 1
@@ -339,6 +400,68 @@ def plan_interventions(
     return tuple(plane)
 
 
+def _with_target_rule(
+    edited: Optional[EditedImage], rule: RuleSpec,
+) -> Optional[EditedImage]:
+    """Attach search-independent provenance to a semantic pixel edit."""
+    if edited is None:
+        return None
+    original = edited.edit
+    edit = PixelEdit(
+        kind=original.kind,
+        description=original.description,
+        boxes=original.boxes,
+        source_entity=original.source_entity,
+        target_entity=original.target_entity,
+        extra={
+            **dict(original.extra or {}),
+            "target_rule_id": rule.rule_id,
+            "target_predicate": rule.canonical_predicate,
+            "target_entity_types": list(rule.entity_types),
+        },
+    )
+    return EditedImage(edited.image, edit, edited.changed_pixels, edited.sha256)
+
+
+def plan_rule_matched_count_interventions(
+    builder: SceneFactBuilder,
+    base_path: str | Path,
+    record: Mapping[str, Any],
+    rules: Sequence[RuleSpec],
+) -> Tuple[Tuple[str, Callable[[np.ndarray], Optional[EditedImage]]], ...]:
+    """Create one exact deletion intervention for each global count rule.
+
+    The edit metadata declares which candidate motivated the edit, but visual
+    confirmation remains independent: ``confirm_intervention`` only checks
+    before/after detector counts.  Unsupported predicates and scoped counts are
+    intentionally excluded from this first controlled experiment.
+    """
+    container, _, _ = _regions(builder, record)
+    plan: List[Tuple[str, Callable[[np.ndarray], Optional[EditedImage]]]] = []
+    seen = set()
+    for rule in rules:
+        if rule.canonical_predicate != "count_eq" or len(rule.entity_types) != 1:
+            continue
+        entity = str(rule.entity_types[0])
+        key = (rule.rule_id, entity)
+        if key in seen:
+            continue
+        seen.add(key)
+        safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", rule.rule_id)
+        safe_entity = re.sub(r"[^A-Za-z0-9_.-]+", "_", entity)
+        name = f"erase_for_{safe_id}_{safe_entity}"
+        plan.append((
+            name,
+            lambda image, current_rule=rule, current_entity=entity: _with_target_rule(
+                erase_entity(
+                    image, record, current_entity, container,
+                ),
+                current_rule,
+            ),
+        ))
+    return tuple(plan)
+
+
 def _flip_with_pair(
     image: np.ndarray,
     record: Mapping[str, Any],
@@ -364,8 +487,13 @@ def materialize_interventions(
     base_paths: Sequence[str | Path],
     records: Mapping[str, Mapping[str, Any]],
     edited_dir: str | Path,
+    *,
+    policy: str = "generic",
+    rules: Sequence[RuleSpec] = (),
 ) -> Dict[str, Dict[str, Any]]:
     """Write edited images to disk and return ``{edited_path: edit_metadata}``."""
+    if policy not in {"generic", "rule_matched_count_erase"}:
+        raise ValueError(f"unknown counterfactual intervention policy: {policy}")
     edited_dir = Path(edited_dir)
     edited_dir.mkdir(parents=True, exist_ok=True)
     manifest: Dict[str, Dict[str, Any]] = {}
@@ -373,7 +501,14 @@ def materialize_interventions(
         base = str(Path(base).resolve())
         record = records[base]
         image = np.asarray(Image.open(base).convert("RGB"))
-        for name, apply in plan_interventions(builder, base, record):
+        plan = (
+            plan_interventions(builder, base, record)
+            if policy == "generic" else
+            plan_rule_matched_count_interventions(
+                builder, base, record, rules,
+            )
+        )
+        for name, apply in plan:
             edited = apply(image)
             if edited is None:
                 continue
@@ -510,7 +645,9 @@ def falsifiability_audit(
 
 __all__ = [
     "DatasetSpec", "discover_breakfast_box", "sha256_file", "detect_split",
+    "detector_cache_fingerprint",
     "calibrate_split", "assemble_facts", "plan_interventions",
+    "plan_rule_matched_count_interventions",
     "materialize_interventions", "finalize_counterfactual_pairs",
     "falsifiability_audit", "CounterfactualAuditRow",
 ]

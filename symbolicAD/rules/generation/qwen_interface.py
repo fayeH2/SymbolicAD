@@ -12,9 +12,12 @@ import torch
 
 from symbolicAD.rules.generation.dsl import (
     NormalityRule, RuleSet, RuleType, parse_qwen_rules,
+    parse_qwen_rules_strict,
     QWEN_RULE_GENERATION_PROMPT, QWEN_RULE_VALIDATION_PROMPT,
     REGISTRY,
 )
+from symbolicAD.rules.generation.ontology import CategoryOntology
+from symbolicAD.rules.generation.ontology_prompt import build_rule_generation_prompt
 from symbolicAD.perception.scene_graph import SceneGraph
 
 
@@ -26,9 +29,14 @@ class QwenVLRuleGenerator:
         model_path: str = "/home/hjh/AgentModels/Qwen3-VL-8B-Thinking",
         device: str = "auto",
         max_new_tokens: int = 2048,
+        enable_thinking: bool = False,
+        force_json_prefill: bool = True,
     ):
         self.model_path = model_path
         self.max_new_tokens = max_new_tokens
+        self.enable_thinking = bool(enable_thinking)
+        self.force_json_prefill = bool(force_json_prefill)
+        self.thinking_control_supported: Optional[bool] = None
         
         if device == "auto":
             self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -37,25 +45,41 @@ class QwenVLRuleGenerator:
         
         self.model = None
         self.processor = None
+        self.last_raw_response = ""
         self._load_model()
     
     def _load_model(self):
         """Load Qwen-VL model (supports both Qwen2-VL and Qwen3-VL)."""
         from transformers import AutoProcessor
-        from transformers import Qwen2_5_VLForConditionalGeneration
+        try:
+            # Qwen3-VL and future image-text models expose this auto class.
+            from transformers import AutoModelForImageTextToText
+            model_class = AutoModelForImageTextToText
+        except ImportError:  # transformers versions predating the auto class
+            from transformers import Qwen2_5_VLForConditionalGeneration
+            model_class = Qwen2_5_VLForConditionalGeneration
         
         self.processor = AutoProcessor.from_pretrained(
             self.model_path, local_files_only=True
         )
-        
+
         dtype = torch.bfloat16 if self.device.startswith("cuda") else torch.float32
-        self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            self.model_path,
-            dtype=dtype,
-            local_files_only=True,
-            low_cpu_mem_usage=True,
-            ignore_mismatched_sizes=True,
-        ).to(self.device).eval()
+        load_options = {
+            "local_files_only": True,
+            "low_cpu_mem_usage": True,
+            # A mismatched checkpoint must fail rather than partially loading
+            # a different Qwen-VL architecture.
+            "ignore_mismatched_sizes": False,
+        }
+        try:
+            self.model = model_class.from_pretrained(
+                self.model_path, dtype=dtype, **load_options
+            )
+        except TypeError:  # transformers<4.56 names this torch_dtype
+            self.model = model_class.from_pretrained(
+                self.model_path, torch_dtype=dtype, **load_options
+            )
+        self.model = self.model.to(self.device).eval()
     
     def _prepare_images(self, image_paths: Sequence[Union[str, Path]]) -> List[Image.Image]:
         """Load and prepare images."""
@@ -99,14 +123,24 @@ class QwenVLRuleGenerator:
         category: str,
         support_image_paths: Sequence[Union[str, Path]],
         k_shot: int,
+        *,
+        prompt: Optional[str] = None,
+        ontology: Optional[CategoryOntology] = None,
     ) -> List[NormalityRule]:
-        """Generate normality rules from support images."""
+        """Generate normality rules from support images.
+
+        By default the prompt is built from the category ontology and the
+        registered predicate capabilities.  A caller may pass an explicit
+        prompt (for example when replaying a provenance-complete audit), but
+        that prompt must be recorded by the caller.
+        """
         images = self._prepare_images(support_image_paths)
         montage = self._create_montage(images)
-        
-        prompt = QWEN_RULE_GENERATION_PROMPT.format(
-            category=category, k_shot=k_shot
-        )
+
+        if prompt is None:
+            prompt = build_rule_generation_prompt(
+                category, k_shot, ontology=ontology
+            )
         
         # Prepare messages
         messages = [
@@ -118,11 +152,32 @@ class QwenVLRuleGenerator:
                 ],
             }
         ]
+        if self.force_json_prefill:
+            messages.append({
+                "role": "assistant",
+                "content": [{"type": "text", "text": "["}],
+            })
         
         # Apply chat template
-        text = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
+        try:
+            template_options = {
+                "tokenize": False,
+                "enable_thinking": self.enable_thinking,
+            }
+            if self.force_json_prefill:
+                template_options["continue_final_message"] = True
+            else:
+                template_options["add_generation_prompt"] = True
+            text = self.processor.apply_chat_template(messages, **template_options)
+            self.thinking_control_supported = True
+        except TypeError:
+            template_options = {"tokenize": False}
+            if self.force_json_prefill:
+                template_options["continue_final_message"] = True
+            else:
+                template_options["add_generation_prompt"] = True
+            text = self.processor.apply_chat_template(messages, **template_options)
+            self.thinking_control_supported = False
         
         inputs = self.processor(
             text=[text],
@@ -142,9 +197,17 @@ class QwenVLRuleGenerator:
         response = self.processor.batch_decode(
             generated, skip_special_tokens=True, clean_up_tokenization_spaces=False
         )[0]
+        if self.force_json_prefill:
+            response = "[" + response
+        self.last_raw_response = response
         
-        # Parse rules
-        rules = parse_qwen_rules(response, category)
+        # Admission runs use JSON prefill and must satisfy the exact output
+        # contract.  Permissive recovery remains diagnostic-only.
+        rules = (
+            parse_qwen_rules_strict(response, category)
+            if self.force_json_prefill
+            else parse_qwen_rules(response, category)
+        )
         
         # Add support evidence metadata
         for rule in rules:
@@ -180,9 +243,17 @@ class QwenVLRuleGenerator:
             }
         ]
         
-        text = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
+        try:
+            text = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+                enable_thinking=self.enable_thinking,
+            )
+            self.thinking_control_supported = True
+        except TypeError:
+            text = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            self.thinking_control_supported = False
         
         inputs = self.processor(
             text=[text],

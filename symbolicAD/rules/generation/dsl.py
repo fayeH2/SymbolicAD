@@ -7,6 +7,7 @@ that supports user-defined predicates (LENGTH, multi-entity relations, etc.).
 from __future__ import annotations
 
 import json
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
@@ -494,6 +495,9 @@ QWEN_RULE_GENERATION_PROMPT = """
 You are an expert in industrial visual inspection. Analyze the provided normal reference images 
 of product category "{category}" and induce a comprehensive set of normality rules.
 
+OUTPUT CONTRACT: Return only one compact JSON array with at most 12 rules.
+Do not expose analysis, chain-of-thought, prose, Markdown, or code fences.
+
 The images show K={k_shot} normal samples. Your task is to identify invariant normal patterns 
 that should hold for ALL normal instances of this category.
 
@@ -509,11 +513,20 @@ Available predicate categories (use these names exactly):
 For each rule, provide:
 - rule_id: unique identifier
 - predicate_name: one of the above predicate names
-- predicate_args: {{"entity_type": "...", "target_entity_type": "..."}} (as needed)
-- predicate_params: {{"expected_value": ..., "tolerance": ..., "threshold": ...}} (as needed)
+- predicate_args and predicate_params must follow the exact predicate schema below.
+- COUNT: predicate_args={{"entity_type":"..."}} for a global count, or add
+  "target_entity_type" only for a real region/container. Never repeat the same
+  entity as its own target. predicate_params={{"expected_count": integer,
+  "tolerance": nonnegative_integer}}.
+- LENGTH/WIDTH/HEIGHT/AREA/ASPECT_RATIO/COLOR_H/COLOR_S/COLOR_V/CIRCULARITY/
+  SOLIDITY: predicate_args={{"entity_type":"..."}},
+  predicate_params={{"expected_value": number,"tolerance": nonnegative_number}}.
+- Spatial/topological binary relations: predicate_args={{"entity_type":"source",
+  "target_entity_type":"target"}} and predicate_params={{"threshold": number}}
+  when a threshold is meaningful.
 - description: human-readable explanation
 - confidence: 0.0-1.0
-- reasoning: why this rule is valid based on the support images
+- reasoning: one short evidence sentence (maximum 20 words)
 
 Output as valid JSON array of rule objects.
 """
@@ -533,25 +546,33 @@ Analyze the image and respond with:
 """
 
 
-def parse_qwen_rules(response: str, category: str) -> List[NormalityRule]:
-    """Parse Qwen-VL response into NormalityRule objects."""
-    try:
-        start = response.find('[')
-        end = response.rfind(']') + 1
-        if start >= 0 and end > start:
-            json_str = response[start:end]
-            rules_data = json.loads(json_str)
-        else:
-            rules_data = json.loads(response)
-    except json.JSONDecodeError:
-        return []
-    
+def _looks_like_rule_payload(value: Any) -> bool:
+    """Whether an object has the minimum shape of a Qwen rule proposal."""
+    return bool(
+        isinstance(value, dict)
+        and str(value.get("rule_id", "")).strip()
+        and str(value.get("predicate_name", "")).strip()
+        and isinstance(value.get("predicate_args"), dict)
+        and isinstance(value.get("predicate_params"), dict)
+    )
+
+
+def _normality_rules_from_payloads(
+    rules_data: List[Dict[str, Any]], category: str,
+) -> List[NormalityRule]:
+    """Convert already-decoded proposal objects to the legacy Qwen record."""
     rules = []
     for i, data in enumerate(rules_data):
         try:
+            try:
+                rule_type = RuleType(str(data.get("rule_type", "custom")).lower())
+            except ValueError:
+                # Unknown labels do not erase the proposal; exact predicate
+                # admission later decides whether it is executable.
+                rule_type = RuleType.CUSTOM
             rule = NormalityRule(
                 rule_id=data.get("rule_id", f"{category}_rule_{i}"),
-                rule_type=RuleType(data.get("rule_type", "custom").lower()),
+                rule_type=rule_type,
                 description=data.get("description", ""),
                 predicate_name=data.get("predicate_name", ""),
                 predicate_args=data.get("predicate_args", {}),
@@ -559,8 +580,8 @@ def parse_qwen_rules(response: str, category: str) -> List[NormalityRule]:
                 confidence=float(data.get("confidence", 0.8)),
                 source="qwen",
             )
-            
-            # Map legacy fields if present
+
+            # Map legacy fields if present.
             params = data.get("parameters", {})
             if "expected_count" in params:
                 rule.expected_count = params["expected_count"]
@@ -571,13 +592,76 @@ def parse_qwen_rules(response: str, category: str) -> List[NormalityRule]:
                 rule.direction = params.get("direction", "stable")
             if "threshold" in params:
                 rule.spatial_threshold = params["threshold"]
-            
             rules.append(rule)
-        except (KeyError, ValueError) as e:
-            print(f"Failed to parse rule {i}: {e}")
+        except (KeyError, TypeError, ValueError):
             continue
-    
     return rules
+
+
+def parse_qwen_rules_strict(response: str, category: str) -> List[NormalityRule]:
+    """Decode the exact JSON contract required for strict admission.
+
+    No prose recovery, Markdown stripping, non-finite values, duplicate rule
+    identifiers or trailing bytes are accepted.  The raw response therefore
+    remains the single source of truth for candidate replay.
+    """
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"non-finite JSON constant: {value}")
+
+    try:
+        payload = json.loads(response, parse_constant=reject_constant)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return []
+    if not isinstance(payload, list) or not 1 <= len(payload) <= 12:
+        return []
+    if not all(_looks_like_rule_payload(item) for item in payload):
+        return []
+    identifiers = [str(item["rule_id"]).strip() for item in payload]
+    if len(identifiers) != len(set(identifiers)):
+        return []
+    for item in payload:
+        confidence = item.get("confidence", 0.8)
+        if isinstance(confidence, bool):
+            return []
+        try:
+            confidence = float(confidence)
+        except (TypeError, ValueError, OverflowError):
+            return []
+        if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+            return []
+        if not isinstance(item.get("description", ""), str):
+            return []
+    return _normality_rules_from_payloads(payload, category)
+
+
+def parse_qwen_rules(response: str, category: str) -> List[NormalityRule]:
+    """Permissively recover a rule array for diagnostic inspection only."""
+    decoder = json.JSONDecoder()
+    candidates = []
+    for start, character in enumerate(response):
+        if character not in "[{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(response[start:])
+        except json.JSONDecodeError:
+            continue
+        if (
+            isinstance(value, list) and value
+            and all(_looks_like_rule_payload(item) for item in value)
+        ):
+            candidates.append((start, value))
+        elif isinstance(value, dict) and isinstance(value.get("rules"), list):
+            wrapped = value["rules"]
+            if wrapped and all(_looks_like_rule_payload(item) for item in wrapped):
+                candidates.append((start, wrapped))
+    if not candidates:
+        return []
+    # Thinking models can emit bracketed prose before the final answer.  Use
+    # the largest valid rule array, with the latest one as deterministic tie
+    # break, instead of slicing from the first '[' to the final ']'.
+    _, rules_data = max(candidates, key=lambda row: (len(row[1]), row[0]))
+
+    return _normality_rules_from_payloads(rules_data, category)
 
 
 __all__ = [
@@ -585,5 +669,5 @@ __all__ = [
     "RuleType", "RuleCondition", "NormalityRule", "RuleSet",
     "RuleType", "PredicateCategory", "PredicateArity",
     "QWEN_RULE_GENERATION_PROMPT", "QWEN_RULE_VALIDATION_PROMPT",
-    "parse_qwen_rules",
+    "parse_qwen_rules", "parse_qwen_rules_strict",
 ]

@@ -214,7 +214,10 @@ class CountEqExecutor:
         entity = rule.entity_types[0]
         expected = rule.parameters.get("expected")
         tolerance = rule.parameters.get("tolerance", 0)
-        confidence = context.verification_confidence(entity)
+        # Count completeness is entity-specific.  An absent/low-score entity
+        # must be UNKNOWN, not a fabricated count of zero.  This is the same
+        # calibration contract already used by CountIn and Exists.
+        complete, confidence = _count_observation_confidence(context, entity)
         if (
             expected is None or tolerance is None
             or float(expected) != int(float(expected))
@@ -226,13 +229,16 @@ class CountEqExecutor:
                 grounding_strategy="instance_mask_or_slot_probability",
             )
         # 检测不完整时，少检测到实例不能被解释成真实“缺件”。
-        if not context.scene.observation_complete or confidence < float(
-            rule.parameters.get("minimum_confidence", 0.5)
+        if (
+            not context.scene.observation_complete
+            or not complete
+            or confidence < float(rule.parameters.get("minimum_confidence", 0.5))
         ):
             return ViolationResult.unknown(
                 rule.rule_id, "count_observation_incomplete",
                 evidence_confidence=confidence, map_size=context.map_size,
                 grounding_strategy="instance_mask_or_slot_probability",
+                details={"entity_type": entity},
             )
         instances = context.scene.instances_of(entity)
         actual = len(instances)
@@ -726,9 +732,10 @@ class LeftOfExecutor(_PairRelationExecutor):
 class AlignedVerticalExecutor(_PairRelationExecutor):
     """``aligned_vertical(a[, b])``: instance x-centroids share one column.
 
-    With one entity type all its instances must be in one column; with two
-    types the type means must share a column.  The spread is normalised by
-    image width, so ``threshold`` is directly comparable across images.
+    With one or two entity types, every distinct grounded instance must lie
+    within the declared x-centroid spread.  The spread is normalised by image
+    width, so ``threshold`` is directly comparable across images.  Repeating
+    one type (``aligned_vertical(x, x)``) never duplicates an instance.
     """
 
     relation_name = "aligned_vertical"
@@ -758,8 +765,37 @@ class AlignedVerticalExecutor(_PairRelationExecutor):
             second = []
         else:
             first = context.scene.instances_of(rule.entity_types[0])
-            second = context.scene.instances_of(rule.entity_types[1])
-        instances = list(first) + list(second)
+            # Qwen commonly emits ALIGNED_VERTICAL(orange, orange).  Fetching
+            # the same type twice must not turn one detection into two
+            # witnesses and incorrectly prove alignment.
+            second = (
+                [] if rule.entity_types[0] == rule.entity_types[1]
+                else context.scene.instances_of(rule.entity_types[1])
+            )
+            if rule.entity_types[0] != rule.entity_types[1] and (
+                not first or not second
+            ):
+                missing = []
+                if not first:
+                    missing.append(rule.entity_types[0])
+                if not second:
+                    missing.append(rule.entity_types[1])
+                return ViolationResult.unknown(
+                    rule.rule_id, "no_grounded_instances",
+                    evidence_confidence=confidence, map_size=context.map_size,
+                    grounding_strategy=self.strategy,
+                    details={
+                        "entity_types": list(rule.entity_types),
+                        "missing_entity_types": missing,
+                    },
+                )
+        instances = []
+        seen_instances = set()
+        for instance in list(first) + list(second):
+            key = str(instance.instance_id)
+            if key not in seen_instances:
+                seen_instances.add(key)
+                instances.append(instance)
         if len(instances) < 2:
             return ViolationResult.unknown(
                 rule.rule_id, "need_two_instances",

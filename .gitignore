@@ -37,6 +37,7 @@ results_v*/
 artifacts/
 cache/
 backups/
+backbone/
 
 # Logs
 *.log
@@ -88,7 +89,6 @@ EXECUTABLE_LOGIC*.md
 FINAL_EXPERIMENT*.md
 MVTEC_FULL*.md
 SYMBOLICDET*.md
-V13_MVTEC*.md
 
 # Demo scripts
 demo_*.py

@@ -311,6 +311,12 @@ def evaluate_spro(
     ]
     if not subset:
         raise ValueError("evaluation subset is empty")
+    if not any(sample.anomaly_type == "good" for sample in subset):
+        raise ValueError(
+            "sPRO requires good images in every family subset for FPR measurement"
+        )
+    if not any(sample.anomaly_type == anomaly_type for sample in subset):
+        raise ValueError(f"no {anomaly_type} samples were supplied")
     region_count = 0
     for sample in subset:
         gt = np.asarray(sample.ground_truth)

@@ -216,6 +216,14 @@ def relocate_entity_to_region(
 
     tx0, ty0, tx1, ty1 = _pad_box(target_region_box, 0, shape)
     patch_height, patch_width = patch.shape[:2]
+    if (
+        patch_height == 0 or patch_width == 0
+        or patch_height > ty1 - ty0 or patch_width > tx1 - tx0
+    ):
+        # Cropping an oversized detection would turn the counterfactual into
+        # an untracked shape edit.  Skip it instead of creating invalid or
+        # semantically ambiguous pixels.
+        return None
     centre_x = int(tx0 + anchor[0] * (tx1 - tx0))
     centre_y = int(ty0 + anchor[1] * (ty1 - ty0))
     left = int(np.clip(centre_x - patch_width // 2, tx0, max(tx0, tx1 - patch_width)))
@@ -273,18 +281,27 @@ def separate_entity_horizontally(
 ) -> Optional[EditedImage]:
     """把同类型实例中最下方的一个水平搬开，破坏竖直对齐。"""
     shape = image.shape[:2]
+    x0, y0, x1, y1 = _pad_box(region_box, 0, shape)
     candidates = [
         row["box_xyxy"] for row in record.get("detections", [])
-        if row["entity_type"] == entity_type
+        if (
+            row["entity_type"] == entity_type
+            and x0 <= (row["box_xyxy"][0] + row["box_xyxy"][2]) / 2 <= x1
+            and y0 <= (row["box_xyxy"][1] + row["box_xyxy"][3]) / 2 <= y1
+        )
     ]
     if len(candidates) < 2:
         return None
-    x0, y0, x1, y1 = _pad_box(region_box, 0, shape)
     box = max(candidates, key=lambda row: row[3])
     patch_box = _pad_box(box, pad, shape)
     patch = image[patch_box[1]:patch_box[3], patch_box[0]:patch_box[2]].copy()
     colour = _background_colour(image, (x0, y0, x1, y1), record)
     patch_height, patch_width = patch.shape[:2]
+    if (
+        patch_height == 0 or patch_width == 0
+        or patch_height > y1 - y0 or patch_width > x1 - x0
+    ):
+        return None
     left = int(np.clip(
         patch_box[0] + shift_fraction * (x1 - x0), x0, max(x0, x1 - patch_width)
     ))

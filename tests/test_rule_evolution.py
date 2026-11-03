@@ -1,6 +1,7 @@
 """Regression tests for scoped counting and the two-objective search contract."""
 
 import numpy as np
+import pytest
 
 from symbolicAD.perception.component_instances import ComponentInstance
 from symbolicAD.perception.scene_graph import SceneGraph
@@ -14,6 +15,7 @@ from symbolicAD.rules.search.symbolicdet_evolution import (
     SearchConfig,
     contains_redundant_rules,
     exhaustive_rule_search,
+    greedy_rule_search,
 )
 
 
@@ -137,3 +139,69 @@ def test_redundancy_check_is_exact_not_shared_object_heuristic():
     alias = _rule("peach_left_alias", "peach", 1)
     assert not contains_redundant_rules((peach, orange))
     assert contains_redundant_rules((peach, alias))
+
+
+def test_non_count_rules_do_not_duplicate_numeric_tolerance_states():
+    """One count gene has 3 choices; one presence gene only add/drop: 3*2-1."""
+    count = _rule("fruit_left", "fruit", 3)
+    presence = RuleSpec(
+        "fruit_exists", "exists", ("fruit",),
+        parameters={"minimum_count": 1}, family="cardinality",
+    )
+    normals = (_breakfast_context(),)
+    counterfactuals = (
+        CounterfactualPair(
+            "move_fruit", _breakfast_context(),
+            _breakfast_context(fruit_on_left=False), "relocate", validated=True,
+        ),
+    )
+    config = SearchConfig(
+        tolerance_grid=(0, 1), minimum_known_fraction=1.0,
+        counterfactual_margin=0.5,
+    )
+    oracle = exhaustive_rule_search(
+        (count, presence), normals, counterfactuals, config=config,
+    )
+    assert oracle.evaluated_genomes == 5
+
+
+def test_greedy_control_reaches_the_simple_oracle_without_extra_losses():
+    candidates = (
+        _rule("fruit_left", "fruit", 3),
+        _rule("peach_left", "peach", 1),
+        _rule("orange_left", "orange", 2),
+    )
+    normals = tuple(_breakfast_context() for _ in range(3))
+    counterfactuals = (
+        CounterfactualPair(
+            "move_fruit", _breakfast_context(),
+            _breakfast_context(fruit_on_left=False), "relocate", validated=True,
+        ),
+    )
+    config = SearchConfig(
+        tolerance_grid=(0, 1), minimum_known_fraction=1.0,
+        counterfactual_margin=0.5, lambda_cf=1.0,
+    )
+    greedy = greedy_rule_search(
+        candidates, normals, counterfactuals, config=config,
+    )
+    oracle = exhaustive_rule_search(
+        candidates, normals, counterfactuals, config=config,
+    )
+    assert greedy.method == "greedy_forward_add_tolerance_control"
+    assert greedy.selected.objectives == oracle.selected.objectives == (0.0, 0.0)
+    assert len(greedy.selected.rules) == 1
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    (
+        {"minimum_known_fraction": float("nan")},
+        {"counterfactual_margin": 0.0},
+        {"lambda_cf": float("inf")},
+        {"lambda_cf": -1.0},
+    ),
+)
+def test_search_config_rejects_nonfinite_or_degenerate_losses(kwargs):
+    with pytest.raises(ValueError):
+        SearchConfig(**kwargs)

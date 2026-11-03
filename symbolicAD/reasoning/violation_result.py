@@ -38,10 +38,19 @@ class ViolationResult:
 
     def __post_init__(self) -> None:
         self.status = RuleStatus(self.status)
-        self.violation_score = float(np.clip(self.violation_score, 0.0, 1.0))
-        self.evidence_confidence = float(np.clip(self.evidence_confidence, 0.0, 1.0))
+        scalars = {
+            "violation_score": float(self.violation_score),
+            "evidence_confidence": float(self.evidence_confidence),
+            "attribution_uncertainty": float(self.attribution_uncertainty),
+        }
+        if not all(np.isfinite(value) for value in scalars.values()):
+            raise ValueError("violation scores and confidences must be finite")
+        self.violation_score = float(np.clip(scalars["violation_score"], 0.0, 1.0))
+        self.evidence_confidence = float(
+            np.clip(scalars["evidence_confidence"], 0.0, 1.0)
+        )
         self.attribution_uncertainty = float(
-            np.clip(self.attribution_uncertainty, 0.0, 1.0)
+            np.clip(scalars["attribution_uncertainty"], 0.0, 1.0)
         )
         if self.status != RuleStatus.VIOLATED:
             # UNKNOWN is not a soft anomaly. SATISFIED and UNKNOWN contribute
@@ -51,7 +60,15 @@ class ViolationResult:
             array = np.asarray(self.anomaly_map, dtype=np.float32)
             if array.ndim != 2:
                 raise ValueError("anomaly_map must be a two-dimensional array")
-            self.anomaly_map = np.clip(array, 0.0, 1.0)
+            if not np.all(np.isfinite(array)):
+                raise ValueError("anomaly_map must contain only finite values")
+            array = np.clip(array, 0.0, 1.0)
+            # The class invariant is stronger than executor conventions:
+            # neither SATISFIED nor UNKNOWN is allowed to carry spatial
+            # anomaly evidence, even if a buggy/custom executor supplies it.
+            if self.status != RuleStatus.VIOLATED:
+                array = np.zeros_like(array, dtype=np.float32)
+            self.anomaly_map = array
 
     @classmethod
     def unknown(

@@ -27,22 +27,21 @@ from PIL import Image
 from ...perception.component_instances import ComponentInstance
 from ...perception.scene_graph import SceneGraph, build_scene_graph
 from ...reasoning.predicate_executor import ExecutionContext
+from ..generation.ontology import DEFAULT_BREAKFAST_ONTOLOGY
 from .calibration import CountCalibration
 from .open_vocab import Detection, DetectionBatch, GroundingDinoDetector, Vocabulary
 
 
-DEFAULT_BREAKFAST_VOCABULARY = Vocabulary({
-    "peach": ("peach",),
-    "orange": ("orange",),
-    "granola": ("granola", "cereal", "muesli"),
-    "banana_slice": ("banana",),
-    "almond": ("almond",),
-    "bento_box": ("bento box", "lunch box", "bento", "lunchbox"),
-})
+# The ontology is the single source of truth for detector phrases and
+# supertypes.  The explicit ``Vocabulary`` shape is preserved for existing
+# callers and serialized cache compatibility.
+DEFAULT_BREAKFAST_VOCABULARY = Vocabulary(
+    DEFAULT_BREAKFAST_ONTOLOGY.detector_vocabulary()
+)
 
-DEFAULT_SUPERTYPES: Mapping[str, Tuple[str, ...]] = {
-    "fruit": ("peach", "orange"),
-}
+DEFAULT_SUPERTYPES: Mapping[str, Tuple[str, ...]] = dict(
+    DEFAULT_BREAKFAST_ONTOLOGY.supertypes
+)
 
 
 @dataclass(frozen=True)
@@ -183,6 +182,37 @@ def batch_from_record(record: Mapping[str, Any]) -> DetectionBatch:
     return DetectionBatch(detections, tuple(record.get("rejected", ())))
 
 
+def _box_area(box: Sequence[float]) -> float:
+    x0, y0, x1, y1 = (float(value) for value in box)
+    return max(0.0, x1 - x0) * max(0.0, y1 - y0)
+
+
+def _intersection_area(left: Sequence[float], right: Sequence[float]) -> float:
+    lx0, ly0, lx1, ly1 = (float(value) for value in left)
+    rx0, ry0, rx1, ry1 = (float(value) for value in right)
+    width = max(0.0, min(lx1, rx1) - max(lx0, rx0))
+    height = max(0.0, min(ly1, ry1) - max(ly0, ry0))
+    return width * height
+
+
+def _container_matches_foreground(
+    container_box: Sequence[float],
+    foreground_box_pixels: Sequence[float],
+    *,
+    minimum_area_ratio: float = 0.5,
+    minimum_container_overlap: float = 0.5,
+) -> bool:
+    """Reject tiny/spurious detector boxes that cannot be the real tray."""
+    container_area = _box_area(container_box)
+    foreground_area = _box_area(foreground_box_pixels)
+    if container_area <= 0.0 or foreground_area <= 0.0:
+        return False
+    if container_area / foreground_area < float(minimum_area_ratio):
+        return False
+    overlap = _intersection_area(container_box, foreground_box_pixels)
+    return overlap / max(container_area, 1e-9) >= float(minimum_container_overlap)
+
+
 def select_container(
     detections: Sequence[Any],
     foreground_box: Optional[Sequence[float]],
@@ -190,25 +220,45 @@ def select_container(
     image_size: Tuple[int, int],
     container_entity: str,
 ) -> Tuple[Tuple[float, float, float, float], float, Optional[str], str]:
-    """Return ``(box, confidence, detector_phrase, source)`` for the tray."""
+    """Return ``(box, confidence, detector_phrase, source)`` for the tray.
+
+    A detector box is accepted only if it is geometrically consistent with the
+    bright foreground silhouette.  A tiny ``bento`` detection on a label or
+    bottom edge must not replace the real tray.
+    """
     width, height = image_size
+    foreground_pixels = None
+    if foreground_box is not None and float(foreground_confidence) > 0.0:
+        foreground_pixels = tuple(
+            float(value) * (width if index % 2 == 0 else height)
+            for index, value in enumerate(foreground_box)
+        )
+
     containers = [
         row for row in detections if row.entity_type == container_entity
     ]
     if containers:
-        container = max(containers, key=lambda row: row.score)
-        return (
-            tuple(float(value) for value in container.box_xyxy),
-            max(float(container.score), float(foreground_confidence)),
-            container.phrase,
-            "groundingdino_bento_box",
+        if foreground_pixels is not None:
+            consistent = [
+                row for row in containers
+                if _container_matches_foreground(row.box_xyxy, foreground_pixels)
+            ]
+        else:
+            consistent = list(containers)
+        if consistent:
+            container = max(consistent, key=lambda row: row.score)
+            return (
+                tuple(float(value) for value in container.box_xyxy),
+                max(float(container.score), float(foreground_confidence)),
+                container.phrase,
+                "groundingdino_bento_box",
+            )
+    if foreground_pixels is not None:
+        source = (
+            "bright_foreground_silhouette_container_mismatch"
+            if containers else "bright_foreground_silhouette"
         )
-    if foreground_box is not None and float(foreground_confidence) > 0.0:
-        box = tuple(
-            float(value) * (width if index % 2 == 0 else height)
-            for index, value in enumerate(foreground_box)
-        )
-        return box, float(foreground_confidence), None, "bright_foreground_silhouette"
+        return foreground_pixels, float(foreground_confidence), None, source
     return (0.0, 0.0, float(width), float(height)), 0.0, None, "full_frame_unverified"
 
 

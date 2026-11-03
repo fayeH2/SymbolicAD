@@ -1,6 +1,7 @@
 import numpy as np
 
 from scripts.evaluate_loco_checkpoint import binary_metrics, defect_group_indices
+from scripts.summarize_loco_class_runs import _validate_counts
 
 
 def test_loco_subgroups_reuse_good_images():
@@ -21,3 +22,19 @@ def test_binary_metrics_reject_single_class_subsets():
         assert "both good and anomalous" in str(error)
     else:
         raise AssertionError("single-class AUROC must fail closed")
+
+
+def test_five_class_summary_rejects_incomplete_test_split():
+    metrics = {
+        "all": {"count": 275, "normal_count": 102},
+        "logical": {"anomaly_count": 83},
+        "structural": {"anomaly_count": 90},
+    }
+    _validate_counts("breakfast_box", metrics)
+    metrics["logical"]["anomaly_count"] = 82
+    try:
+        _validate_counts("breakfast_box", metrics)
+    except ValueError as error:
+        assert "sample count mismatch" in str(error)
+    else:
+        raise AssertionError("incomplete LOCO test split must fail closed")
