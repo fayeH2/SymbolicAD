@@ -401,7 +401,7 @@ def _evaluate_spatial(
         best_index = int(np.argmax(scores))
         best_scores.append(float(scores[best_index]))
         best_partner.append(instances_b[best_index])
-        best_percent.append(containment(instances_a[len(best_percent)], best_partner[-1]))
+        best_percent.append(containment(instance_a, instances_b[best_index]))
 
     truth = _clip01(float(np.mean(best_scores)))
     failing = [

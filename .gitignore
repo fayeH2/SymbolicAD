@@ -38,6 +38,7 @@ artifacts/
 cache/
 backups/
 backbone/
+backbones/
 
 # Logs
 *.log
@@ -60,8 +61,8 @@ evolutionary*.log
 *.pt
 
 # Data
-data/
-datasets/
+/data/
+/datasets/
 *.csv
 
 # OS

@@ -1,0 +1,63 @@
+dataset: mvtec_loco
+category: ""
+shot: 4
+seed: 668
+support_seed: 668
+mode: baseline_logic
+max_images_per_group: 0
+
+model:
+  clip_model: hf-hub:timm/vit_base_patch16_clip_224.openai
+  device: cuda:0
+  image_size: 224
+  batch_size: 16
+  logit_scale: 100.0
+
+grounding:
+  alpha: 0.5
+  component_threshold: 0.55
+  min_instance_area: 8
+  morphology_kernel: 3
+  support_quantile_low: 0.50
+  support_quantile_high: 0.99
+  max_prototypes_per_component: 32
+  text_embedding_cache: true
+
+logic:
+  count_sigma: 1.0
+  ratio_sigma: 0.25
+  lambda_feature: 0.3
+  lambda_relation: 0.5
+  lambda_pair_prompt: 0.2
+  dummy_match_cost: 0.5
+  spatial_temperature: 1.0
+  eta: 0.5
+  rescore_temperature: 0.07
+  fail_threshold: 0.5
+  and_epsilon: 1.0e-6
+
+fusion:
+  lambda_logic: 0.5
+  beta: 0.5
+  topk_percent: 1.0
+  map_epsilon: 1.0e-6
+
+evaluation:
+  pixel_eval_size: 256
+  pixel_max_points: 4000000
+  pro_fpr_limit: 0.30
+  pro_thresholds: 64
+  enable_pro: true
+
+output:
+  save_maps: true
+  map_dtype: float16
+  save_visualizations: true
+  save_traces: true
+  save_predictions: true
+
+paths:
+  data_root: /home/hjh/Desktop/0Datasets/anomaly/industrial/MVTecLOCO/MVTecLOCO
+  cache_dir: cache
+  results_dir: results
+  clip_cache_dir: /home/hjh/.cache/huggingface/hub

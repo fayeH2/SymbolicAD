@@ -1,0 +1,17 @@
+dataset: mvtec_loco
+shot: 4
+seed: 668
+support_seed: 668
+
+paths:
+  data_root: /home/hjh/Desktop/0Datasets/anomaly/industrial/MVTecLOCO/MVTecLOCO
+
+evaluation:
+  pixel_eval_size: 256
+  enable_pro: true
+
+groups:
+  - good
+  - logical
+  - structural
+  - all

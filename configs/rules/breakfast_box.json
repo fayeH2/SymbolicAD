@@ -1,0 +1,24 @@
+{
+  "category": "breakfast_box",
+  "components": [
+    {"name": "Box", "prompts": ["a breakfast box", "a compartmented food box", "a breakfast tray"], "synonyms": ["box"]},
+    {"name": "Egg", "prompts": ["an egg in a breakfast box", "a boiled egg", "an egg"], "synonyms": ["egg"]},
+    {"name": "Sausage", "prompts": ["a sausage in a breakfast box", "a cooked sausage", "a sausage"], "synonyms": ["sausage"]},
+    {"name": "Bread", "prompts": ["bread in a breakfast box", "a bread roll", "bread"], "synonyms": ["bread"]},
+    {"name": "Fruit", "prompts": ["fruit in a breakfast box", "a piece of fruit", "fruit"], "synonyms": ["fruit"]}
+  ],
+  "atoms": [
+    {"id": "R1", "expression": "Exist(Box)", "normal_prompt": "a breakfast box present in the scene", "violation_prompt": "a missing breakfast box"},
+    {"id": "R2", "expression": "Exist(Egg)", "normal_prompt": "eggs present in the breakfast box", "violation_prompt": "missing eggs"},
+    {"id": "R3", "expression": "Exist(Sausage)", "normal_prompt": "sausages present in the breakfast box", "violation_prompt": "missing sausages"},
+    {"id": "R4", "expression": "CountEq(Egg,2)", "normal_prompt": "two eggs in the breakfast box", "violation_prompt": "the wrong number of eggs"},
+    {"id": "R5", "expression": "CountEq(Sausage,2)", "normal_prompt": "two sausages in the breakfast box", "violation_prompt": "the wrong number of sausages"},
+    {"id": "R6", "expression": "Inside(Egg,Box)", "normal_prompt": "eggs correctly placed in their compartment", "violation_prompt": "an egg outside its compartment"},
+    {"id": "R7", "expression": "Inside(Sausage,Box)", "normal_prompt": "sausages correctly placed in their compartment", "violation_prompt": "a sausage outside its compartment"},
+    {"id": "R8", "expression": "Inside(Bread,Box)", "normal_prompt": "bread correctly placed in its compartment", "violation_prompt": "bread outside its compartment"}
+  ],
+  "formula": {"op": "AND", "children": ["R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8"]},
+  "lexicon": {"component_prompts": {}, "atom_prompts": {}},
+  "support_evidence": {},
+  "metadata": {"source": "manual-template", "stage": "1-3", "notes": "approximate logical rules for MVTec LOCO breakfast_box"}
+}
