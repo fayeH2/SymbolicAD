@@ -62,6 +62,7 @@ grounding:
   text_embedding_cache: true
 
 logic:
+  enabled: true
   count_sigma: 1.0
   ratio_sigma: 0.25
   lambda_feature: 0.3

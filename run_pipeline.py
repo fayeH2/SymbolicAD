@@ -58,6 +58,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="disable the segment-first dynamic-expression MoE supplement",
     )
     parser.add_argument(
+        "--no-qwen-logic",
+        action="store_true",
+        help="disable Qwen component rules while keeping SymbolicDet enabled",
+    )
+    parser.add_argument(
         "--allow-transductive",
         action="store_true",
         help=(
@@ -105,6 +110,8 @@ def main() -> None:
         config.evaluation.enable_pro = False
     if args.no_symbolicdet:
         config.symbolicdet.enabled = False
+    if args.no_qwen_logic:
+        config.logic.enabled = False
     if args.allow_transductive:
         config.evaluation.allow_transductive = True
 

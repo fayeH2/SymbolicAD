@@ -562,8 +562,11 @@ def run_category(
     if baseline_selection is not None:
         validation["baseline_selection"] = baseline_selection
 
-    use_logic = config.mode in {"baseline_logic", "logic"}
-    use_symbolicdet = bool(config.symbolicdet.enabled) and use_logic
+    supplement_mode = config.mode in {"baseline_logic", "logic"}
+    use_qwen_logic = bool(config.logic.enabled) and supplement_mode
+    use_symbolicdet = bool(config.symbolicdet.enabled) and supplement_mode
+    lambda_logic = 0.0
+    beta = 0.0
     symbolicdet = None
     if use_symbolicdet:
         symbolicdet = SegmentFirstSymbolicDet(config.symbolicdet).fit(support_images)
@@ -586,7 +589,7 @@ def run_category(
     rule_kb: Optional[RuleKB] = None
 
     memory_path = _support_memory_path(config, category)
-    if use_logic:
+    if use_qwen_logic:
         rule_kb = load_or_generate_rules(
             category,
             config.rule_cache_dir,
@@ -673,7 +676,7 @@ def run_category(
             baseline, encoded, support_memory.baseline_stats, images=images
         )
         component_maps: Dict[str, np.ndarray] = {}
-        if use_logic and rule_kb is not None and support_memory is not None:
+        if use_qwen_logic and rule_kb is not None and support_memory is not None:
             component_maps = build_component_maps(
                 backbone,
                 patches,
@@ -688,7 +691,7 @@ def run_category(
             atom_results = {}
             scene_summary: Dict[str, object] = {}
             symbolic_output = symbolicdet.infer(image) if symbolicdet is not None else None
-            if use_logic and rule_kb is not None and support_memory is not None:
+            if use_qwen_logic and rule_kb is not None and support_memory is not None:
                 scene_graph = _build_scene_graph(
                     offset,
                     rule_kb,
@@ -727,7 +730,7 @@ def run_category(
             )
 
     reliability: Dict[str, float] = {}
-    if use_logic and bool(config.evaluation.allow_transductive):
+    if use_qwen_logic and bool(config.evaluation.allow_transductive):
         reliability, reliability_info = _transductive_atom_reliability(
             records, float(config.logic.fail_threshold)
         )
@@ -776,7 +779,7 @@ def run_category(
         fusion_info["beta"] = float(beta)
         fusion_info["image_logic_weight"] = float(config.fusion.image_logic_weight)
         validation["fusion"] = fusion_info
-    elif use_logic:
+    elif use_qwen_logic:
         # Strict FSAD: only normal support images may calibrate rules/fusion.
         # A rule violated by many query images may be the desired anomaly cue,
         # so query frequency must not be used to disable it.
@@ -821,7 +824,7 @@ def run_category(
         logic_map = np.zeros_like(base_map, dtype=np.float32)
         logic_result = None
         symbolic_output = record.get("symbolicdet")
-        if use_logic and rule_kb is not None and support_memory is not None:
+        if use_qwen_logic and rule_kb is not None and support_memory is not None:
             for atom_id, result in atom_results.items():
                 scale = reliability.get(atom_id, 1.0)
                 if scale <= 0.0:
@@ -897,7 +900,7 @@ def run_category(
             logic_score = 1.0 - (1.0 - active_qwen_score) * (1.0 - symbolic_score)
             symbolic_trace = symbolic_output.trace()
         else:
-            if use_logic:
+            if use_qwen_logic:
                 logic_map = (
                     qwen_logic_map
                     if float(lambda_logic) > 0.0
@@ -945,7 +948,7 @@ def run_category(
                 "qwen_logic_score": float(qwen_logic_score),
                 "qwen_logic_active": bool(
                     float(lambda_logic) > 0.0 or float(beta) > 0.0
-                ) if use_logic else False,
+                ) if use_qwen_logic else False,
                 "symbolicdet": symbolic_trace,
                 **scene_summary,
             },
@@ -956,7 +959,7 @@ def run_category(
     metrics["mode"] = config.mode
     metrics["support"] = [str(path) for path in support_paths]
     metrics["validation"] = validation
-    metrics["support_memory"] = str(memory_path) if use_logic else None
+    metrics["support_memory"] = str(memory_path) if use_qwen_logic else None
     metrics["protocol"] = {
         "name": (
             "transductive_unlabelled_query"

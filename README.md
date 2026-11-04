@@ -200,8 +200,8 @@ violations assign responsibility to both participating masks.
 
 This branch is fused independently from Qwen logic, so a noisy Qwen rule bank
 may abstain without silently disabling the segment-first result.  Use
-`--no-symbolicdet` for the Qwen-only ablation.  Every run saves the fitted,
-human-readable expressions to
+`--no-symbolicdet` for the Qwen-only ablation and `--no-qwen-logic` for the
+SymbolicDet-only ablation.  Every run saves the fitted, human-readable expressions to
 `checkpoint/<category>_symbolicdet.json`.  The detailed audit and required
 ablation matrix are in `docs/v5_audit.md`.
 

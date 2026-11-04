@@ -69,6 +69,7 @@ class GroundingConfig:
 
 @dataclass
 class LogicConfig:
+    enabled: bool = True
     count_sigma: float = 1.0
     ratio_sigma: float = 0.25
     lambda_feature: float = 0.3

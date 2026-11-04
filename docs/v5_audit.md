@@ -73,6 +73,19 @@ Run every row with the same support seed and full test set (`max_images=0`):
 | B2 | yes | no | yes | mentor module contribution |
 | V5 | yes | yes | yes | complete method |
 
+CLI mapping:
+
+```bash
+# B0
+python run_pipeline.py --mode baseline --all --shot 2
+# B1
+python run_pipeline.py --mode baseline_logic --all --shot 2 --no-symbolicdet
+# B2
+python run_pipeline.py --mode baseline_logic --all --shot 2 --no-qwen-logic
+# V5
+python run_pipeline.py --mode baseline_logic --all --shot 2
+```
+
 Report image AUROC separately for logical and structural groups, pixel AUROC/AP
 and AUPRO, plus `logic_contribution` and qualitative failure cases.  The 94%
 target is a goal, not a property to force through query-set selection; it is
