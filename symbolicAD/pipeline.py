@@ -54,6 +54,7 @@ from .rules.executor import execute_formula
 from .rules.qwen_rule_generator import load_or_generate_rules
 from .rules.schema import RuleKB
 from .rules.validator import validate_against_support, validate_rule_kb
+from .symbolicdet import SegmentFirstSymbolicDet
 from .visualization.render_results import ResultRenderer
 from .visualization.result_layout import (
     RunLayout,
@@ -562,6 +563,25 @@ def run_category(
         validation["baseline_selection"] = baseline_selection
 
     use_logic = config.mode in {"baseline_logic", "logic"}
+    use_symbolicdet = bool(config.symbolicdet.enabled) and use_logic
+    symbolicdet = None
+    if use_symbolicdet:
+        symbolicdet = SegmentFirstSymbolicDet(config.symbolicdet).fit(support_images)
+        symbolic_payload = symbolicdet.to_dict()
+        validation["symbolicdet"] = {
+            "enabled": True,
+            "protocol": "normal_support_only",
+            "n_expressions": len(symbolicdet.expressions),
+            "expert_weights": dict(symbolicdet.expert_weights),
+        }
+        symbolic_path = (
+            Path(config.results_dir) / "checkpoint" / f"{category}_symbolicdet.json"
+        )
+        symbolic_path.parent.mkdir(parents=True, exist_ok=True)
+        symbolic_path.write_text(
+            json.dumps(symbolic_payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
     support_memory: Optional[SupportMemory] = None
     rule_kb: Optional[RuleKB] = None
 
@@ -608,7 +628,7 @@ def run_category(
                 config,
             )
             save_support_memory(support_memory, memory_path)
-        rule_kb, validation = _prepare_rule_bank(
+        rule_kb, rule_validation = _prepare_rule_bank(
             category,
             config,
             support_memory,
@@ -616,6 +636,7 @@ def run_category(
             support_images=support_images,
             rule_kb=rule_kb,
         )
+        validation.update(rule_validation)
         if baseline_selection is not None:
             validation["baseline_selection"] = baseline_selection
         lambda_logic, beta, fusion_info = _fusion_weights(
@@ -666,6 +687,7 @@ def run_category(
             image = images[offset]
             atom_results = {}
             scene_summary: Dict[str, object] = {}
+            symbolic_output = symbolicdet.infer(image) if symbolicdet is not None else None
             if use_logic and rule_kb is not None and support_memory is not None:
                 scene_graph = _build_scene_graph(
                     offset,
@@ -700,6 +722,7 @@ def run_category(
                     "base_score": float(base_scores[offset]),
                     "atom_results": atom_results,
                     "scene_summary": scene_summary,
+                    "symbolicdet": symbolic_output,
                 }
             )
 
@@ -794,8 +817,10 @@ def run_category(
         base_score = float(record["base_score"])
         atom_results = record["atom_results"]  # type: ignore[assignment]
         scene_summary = record["scene_summary"]  # type: ignore[assignment]
+        qwen_logic_map = np.zeros_like(base_map, dtype=np.float32)
         logic_map = np.zeros_like(base_map, dtype=np.float32)
         logic_result = None
+        symbolic_output = record.get("symbolicdet")
         if use_logic and rule_kb is not None and support_memory is not None:
             for atom_id, result in atom_results.items():
                 scale = reliability.get(atom_id, 1.0)
@@ -810,7 +835,7 @@ def run_category(
                 fail_threshold=config.logic.fail_threshold,
                 epsilon=config.logic.and_epsilon,
             )
-            logic_map, _ = build_logic_heatmap(
+            qwen_logic_map, _ = build_logic_heatmap(
                 atom_results,
                 rule_kb,
                 dummy_patches,
@@ -818,31 +843,70 @@ def run_category(
                 config,
                 logic_result=logic_result,
             )
-            logic_map = normalize_logic_map(
-                logic_map,
+            qwen_logic_map = normalize_logic_map(
+                qwen_logic_map,
                 support_memory.logic_stats,
                 config.fusion.map_epsilon,
             )
-            final_map = fuse_maps(base_map, logic_map, lambda_logic)
             score_size = int(config.evaluation.pixel_eval_size)
             if logic_result.active_failed_atom_ids:
-                logic_score = logic_image_score(
-                    cv2.resize(logic_map, (score_size, score_size)),
+                qwen_logic_score = logic_image_score(
+                    cv2.resize(qwen_logic_map, (score_size, score_size)),
                     logic_result.root_truth,
                     config.fusion.topk_percent,
                 )
             else:
-                logic_score = 0.0
+                qwen_logic_score = 0.0
+            final_map = fuse_maps(base_map, qwen_logic_map, lambda_logic)
             final_score = final_image_score(
                 base_score,
-                logic_score,
+                qwen_logic_score,
                 beta,
                 baseline_scale=float(config.fusion.image_logic_scale),
             )
         else:
             final_map = base_map
-            logic_score = 0.0
+            qwen_logic_score = 0.0
             final_score = base_score
+
+        symbolic_score = 0.0
+        symbolic_trace = None
+        if symbolic_output is not None:
+            symbolic_map = cv2.resize(
+                np.asarray(symbolic_output.anomaly_map, dtype=np.float32),
+                (base_map.shape[1], base_map.shape[0]),
+                interpolation=cv2.INTER_LINEAR,
+            )
+            symbolic_score = float(symbolic_output.score)
+            symbolic_confidence = float(symbolic_output.confidence)
+            symbolic_lambda = float(config.symbolicdet.fusion_weight) * symbolic_confidence
+            final_map = fuse_maps(final_map, symbolic_map, symbolic_lambda)
+            final_score += (
+                float(config.symbolicdet.image_weight)
+                * symbolic_confidence
+                * symbolic_score
+            )
+            # The public logic panel/metric represents evidence that actually
+            # participates in fusion. Raw abstained Qwen evidence remains in
+            # the trace, but cannot masquerade as an active localisation map.
+            active_qwen_map = (
+                qwen_logic_map if float(lambda_logic) > 0.0 else np.zeros_like(qwen_logic_map)
+            )
+            active_qwen_score = qwen_logic_score if float(beta) > 0.0 else 0.0
+            logic_map = 1.0 - (1.0 - active_qwen_map) * (1.0 - symbolic_map)
+            logic_score = 1.0 - (1.0 - active_qwen_score) * (1.0 - symbolic_score)
+            symbolic_trace = symbolic_output.trace()
+        else:
+            if use_logic:
+                logic_map = (
+                    qwen_logic_map
+                    if float(lambda_logic) > 0.0
+                    else np.zeros_like(qwen_logic_map)
+                )
+                logic_score = qwen_logic_score if float(beta) > 0.0 else 0.0
+            else:
+                logic_map = np.zeros_like(qwen_logic_map)
+                logic_score = 0.0
 
         scores = {
             "baseline": base_score,
@@ -878,6 +942,11 @@ def run_category(
                 "group": sample.group,  # type: ignore[union-attr]
                 "defect_type": sample.defect_type,  # type: ignore[union-attr]
                 "baseline_raw_score": base_score,
+                "qwen_logic_score": float(qwen_logic_score),
+                "qwen_logic_active": bool(
+                    float(lambda_logic) > 0.0 or float(beta) > 0.0
+                ) if use_logic else False,
+                "symbolicdet": symbolic_trace,
                 **scene_summary,
             },
         )
@@ -926,8 +995,16 @@ def run_category(
         "effective_image_logic_weight": float(
             validation.get("fusion", {}).get("beta", 0.0)
         ),
+        "symbolicdet_enabled": bool(use_symbolicdet),
+        "symbolicdet_fusion_weight": (
+            float(config.symbolicdet.fusion_weight) if use_symbolicdet else 0.0
+        ),
+        "symbolicdet_image_weight": (
+            float(config.symbolicdet.image_weight) if use_symbolicdet else 0.0
+        ),
         "logic_abstained": bool(
             validation.get("fusion", {}).get("abstain", 0.0) >= 0.5
+            and not use_symbolicdet
         ),
     }
 

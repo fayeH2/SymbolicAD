@@ -188,6 +188,23 @@ Rules are generated automatically by Qwen3-VL; there are no category-specific
 constants, templates or hand-written atoms.  The same pipeline runs for all
 five MVTec LOCO classes.
 
+## V5 segment-first SymbolicDet + sparse MoE
+
+The mentor-proposed supplement is implemented in `symbolicAD/symbolicdet` and
+enabled by default in `baseline_logic` mode.  It segments the two normal
+supports, extracts foreground/colour/spatial attributes, fits explicit dynamic
+interval expressions and evaluates appearance, structure and pair-relation
+experts.  A per-image sparse router combines the strongest experts.  Missing
+components are localised with their expected support masks, while relation
+violations assign responsibility to both participating masks.
+
+This branch is fused independently from Qwen logic, so a noisy Qwen rule bank
+may abstain without silently disabling the segment-first result.  Use
+`--no-symbolicdet` for the Qwen-only ablation.  Every run saves the fitted,
+human-readable expressions to
+`checkpoint/<category>_symbolicdet.json`.  The detailed audit and required
+ablation matrix are in `docs/v5_audit.md`.
+
 ## Historical 2-shot results (MVTec LOCO, 448 input)
 
 The table below predates the strict support-only protocol guard and must not be

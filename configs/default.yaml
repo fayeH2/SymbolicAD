@@ -123,6 +123,33 @@ fusion:
   image_logic_scale: 1.0
   max_support_image_noise: 0.30
 
+# Mentor-proposed segment-first supplement. All thresholds and MoE gates are
+# fitted from the normal support images only; it never tunes on query labels or
+# the query score distribution.
+symbolicdet:
+  enabled: true
+  analysis_size: 128
+  color_clusters: 4
+  grid_rows: 4
+  grid_cols: 4
+  min_segment_area_ratio: 0.0015
+  max_segments: 48
+  foreground_color_distance: 0.08
+  morphology_kernel: 3
+  relative_margin: 0.15
+  occupancy_margin: 0.04
+  color_margin: 0.06
+  position_margin: 0.06
+  count_margin: 0.5
+  violation_temperature: 1.0
+  expert_top_k: 2
+  appearance_weight: 0.40
+  structure_weight: 0.35
+  relation_weight: 0.25
+  fusion_weight: 0.25
+  image_weight: 0.05
+  min_expression_confidence: 0.10
+
 evaluation:
   pixel_eval_size: 256
   pixel_max_points: 4000000

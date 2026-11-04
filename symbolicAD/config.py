@@ -144,6 +144,34 @@ class FusionConfig:
 
 
 @dataclass
+class SymbolicDetConfig:
+    """Support-only segmentation, dynamic expressions and sparse MoE."""
+
+    enabled: bool = True
+    analysis_size: int = 128
+    color_clusters: int = 4
+    grid_rows: int = 4
+    grid_cols: int = 4
+    min_segment_area_ratio: float = 0.0015
+    max_segments: int = 48
+    foreground_color_distance: float = 0.08
+    morphology_kernel: int = 3
+    relative_margin: float = 0.15
+    occupancy_margin: float = 0.04
+    color_margin: float = 0.06
+    position_margin: float = 0.06
+    count_margin: float = 0.5
+    violation_temperature: float = 1.0
+    expert_top_k: int = 2
+    appearance_weight: float = 0.40
+    structure_weight: float = 0.35
+    relation_weight: float = 0.25
+    fusion_weight: float = 0.25
+    image_weight: float = 0.05
+    min_expression_confidence: float = 0.10
+
+
+@dataclass
 class EvaluationConfig:
     pixel_eval_size: int = 256
     pixel_max_points: int = 4_000_000
@@ -191,6 +219,7 @@ class Config:
     qwen: QwenConfig = field(default_factory=QwenConfig)
     compiler: CompilerConfig = field(default_factory=CompilerConfig)
     fusion: FusionConfig = field(default_factory=FusionConfig)
+    symbolicdet: SymbolicDetConfig = field(default_factory=SymbolicDetConfig)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
     paths: PathsConfig = field(default_factory=PathsConfig)
@@ -230,6 +259,7 @@ _SECTIONS = {
     "qwen": QwenConfig,
     "compiler": CompilerConfig,
     "fusion": FusionConfig,
+    "symbolicdet": SymbolicDetConfig,
     "evaluation": EvaluationConfig,
     "output": OutputConfig,
     "paths": PathsConfig,

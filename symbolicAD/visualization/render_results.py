@@ -172,7 +172,14 @@ class ResultRenderer:
             )
         if self.config.output.save_visualizations:
             self._render(
-                category, image_id, rgb, gt_mask, maps, atom_results, logic_result
+                category,
+                image_id,
+                rgb,
+                gt_mask,
+                maps,
+                atom_results,
+                logic_result,
+                extra or {},
             )
 
     def _save_triplet(
@@ -205,6 +212,7 @@ class ResultRenderer:
         maps: Dict[str, np.ndarray],
         atom_results,
         logic_result,
+        extra: Dict[str, object],
     ) -> None:
         size = (rgb.shape[0], rgb.shape[1])
         base = _resize(maps["baseline"], size)
@@ -233,7 +241,15 @@ class ResultRenderer:
         axes[5].axis("off")
 
         lines = []
-        if logic_result is not None:
+        symbolic = extra.get("symbolicdet")
+        if isinstance(symbolic, dict):
+            for violation in symbolic.get("violations", [])[:4]:
+                lines.append(
+                    "SD "
+                    f"{violation.get('feature')}: {float(violation.get('value', 0.0)):.2f} "
+                    f"(v={float(violation.get('severity', 0.0)):.2f})"
+                )
+        if logic_result is not None and bool(extra.get("qwen_logic_active", True)):
             for failed in getattr(logic_result, "failed_atoms", [])[:6]:
                 lines.append(f"{failed['expression']}: {failed['truth']:.2f}")
         if lines:

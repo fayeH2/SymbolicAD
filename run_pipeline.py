@@ -53,6 +53,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--no-pro", action="store_true")
     parser.add_argument(
+        "--no-symbolicdet",
+        action="store_true",
+        help="disable the segment-first dynamic-expression MoE supplement",
+    )
+    parser.add_argument(
         "--allow-transductive",
         action="store_true",
         help=(
@@ -98,6 +103,8 @@ def main() -> None:
         config.output.save_reference_images = False
     if args.no_pro:
         config.evaluation.enable_pro = False
+    if args.no_symbolicdet:
+        config.symbolicdet.enabled = False
     if args.allow_transductive:
         config.evaluation.allow_transductive = True
 
