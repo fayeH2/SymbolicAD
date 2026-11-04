@@ -61,6 +61,8 @@ def _make_expression(kind: str, args: List[object], params: Dict[str, object]) -
         return f"{relation}({args[0]},{args[1]})"
     if kind == "AttributeMatch":
         return f"AttributeMatch({args[0]},{args[1]},{args[2]})"
+    if kind == "PositionMatch":
+        return f"PositionMatch({args[0]},{args[1]})"
     if kind == "CountInRange":
         return f"CountInRange({args[0]},{_number(args[1])},{_number(args[2])})"
     if kind == "CountEq":
@@ -517,7 +519,7 @@ def compile_rule_kb(
             groups["count"].append(atom)
         elif atom.kind == "OneToOne":
             groups["correspondence"].append(atom)
-        elif atom.kind == "SpatialRelation":
+        elif atom.kind in {"SpatialRelation", "PositionMatch"}:
             groups["spatial"].append(atom)
         elif atom.kind == "AttributeMatch":
             groups["attribute"].append(atom)

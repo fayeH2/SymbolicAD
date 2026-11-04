@@ -1,4 +1,4 @@
-# SymbolicAD V4.0
+# SymbolicAD V4.1
 
 Staged neuro-symbolic anomaly detection for MVTec LOCO.
 
@@ -49,18 +49,34 @@ query image ─► CLIP patches ─┬─► zero-shot baseline map
 
 ## Commands
 
-Baseline-only smoke run (Stage 1 completion criterion):
+2-shot baseline:
 
 ```bash
-python scripts/generate_rules.py --category juice_bottle --shot 8
-python run_pipeline.py --mode baseline --category juice_bottle --max-images 20
+python run_pipeline.py --mode baseline --category juice_bottle --shot 2
+python run_pipeline.py --mode baseline --all --shot 2
 ```
 
-Baseline + logic (Stages 2–3):
+2-shot baseline + logic (automatic Qwen rules and support calibration):
 
 ```bash
-python run_pipeline.py --mode baseline_logic --category juice_bottle
-python run_pipeline.py --mode baseline_logic --all
+python run_pipeline.py --mode baseline_logic --category juice_bottle --shot 2
+python run_pipeline.py --mode baseline_logic --all --shot 2
+```
+
+Every run writes to a fresh timestamped directory.  If a run was executed with
+`--no-visualizations --no-maps`, the images can be reconstructed later from the
+saved predictions and traces without re-running CLIP:
+
+```bash
+python scripts/render_saved_results.py --run-dir results_2shot/<timestamp>_k2
+python scripts/render_saved_results.py --run-dir results_2shot/<timestamp>_k2 --limit 20
+```
+
+Two categories can be run in parallel on two GPUs:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python run_pipeline.py --mode baseline --category juice_bottle --shot 2 --device cuda:0 &
+CUDA_VISIBLE_DEVICES=1 python run_pipeline.py --mode baseline --category pushpins --shot 2 --device cuda:0 &
 ```
 
 Other entry points:
@@ -108,23 +124,89 @@ a rule value when support is noisy) and writes
 `logic.rescore_enabled` defaults to `false`, so `violation_prompt` does not
 affect heat-maps unless explicitly enabled.
 
-## Baseline and semantic-visual fusion
+## Few-shot baseline (PromptAD / AnomalyCLIP-style)
 
-The baseline is **CLIP few-shot**, not zero-shot and not INP-Former.  It builds
-a normal patch bank from the same support images that Qwen uses for rule
-generation, and it uses the same `CLIPBackbone` patch features as component
-grounding:
+The baseline is **CLIP few-shot**, not zero-shot and not INP-Former.  It is
+trained-free and category-agnostic; only the normal support images and the
+category name are used:
+
+- **Dense multi-layer features.** Patch tokens are read from several ViT
+  blocks (`model.feature_layers`, e.g. `[3, 8, 11]`) instead of only the final
+  projected layer.  Middle blocks preserve local structure.
+- **Local neighbourhood smoothing.** Query/support features are blended with a
+  3x3 average (`local_radius`, `local_weight`) before matching.
+- **Fixed ensemble under strict FSAD.** `model.feature_source=both` is fixed
+  before seeing test queries.  The former Otsu `auto` selector remains only as
+  an explicitly enabled transductive ablation (`--allow-transductive`) and its
+  results are marked separately.
+- **Textual normal-vs-damaged branch.** Generic normal/damaged prompts are
+  calibrated on support and fused at image level; the pixel map uses the visual
+  memory branch, because text maps were not spatially reliable in the 2-shot
+  setting.
+- **Support-only calibration.** The image score is a top-k statistic of the
+  support-calibrated map; optional whitening (`model.whiten`) is available but
+  disabled by default because it damaged pixel localisation on LOCO.
+- **Generic foreground prior.** The background colour is estimated from the
+  image border (not hard-coded to black), and the prior is soft so it cannot
+  erase small defects.
 
 ```text
-CLIP patches ──► normal support patch bank ──► baseline heat-map H_base
-             └─► component maps / atom responsibilities ──► logic heat-map H_logic
-H_final = 1 - (1 - H_base) * (1 - lambda * H_logic)
+native ViT layers ─┐
+projected layer   ─┼─► support patch bank ─► local cosine kNN ─► H_visual
+                   │
+CLIP text prompts ─┴─► normal/damaged logits ─► image-level residual
 ```
 
-Thus the symbolic rules and the baseline live in the same CLIP visual-semantic
-space and are fused on the same patch grid.  A pure visual baseline such as
-INP-Former would require an additional projection/alignment mechanism before
-this fusion could be meaningful.
+## Rule grounding, support calibration and fusion
+
+The Qwen rules are aligned to pixel space in three stages:
+
+1. **Support-calibrated atom truth.**  Each atom is evaluated with a
+   leave-one-out support memory.  Atoms whose normal-support truth is low, or
+   which fail on more than half of the held-out normal images, are disabled as
+   grounding failures.  Query truths are expressed relative to the support
+   q05/q50 range.
+2. **Soft responsibility maps.**  Failed count/attribute/position/relation atoms
+   project instance masks weighted by violation severity, not hard binary
+   masks.  The logic map is smoothed and normalised by the leave-one-out normal
+   logic noise floor.
+3. **Gated fusion.**  Pixel fusion is only enabled when the support logic map is
+   quiet (`fusion.max_support_logic_noise`); otherwise the symbolic branch
+   abstains.  Strict evaluation never disables atoms from query-set statistics:
+   doing so can erase a valid rule precisely because many anomalies violate it.
+   The old query-frequency filter is available only in transductive ablations.
+   Image-level symbolic evidence is added as a small support-calibrated residual.
+
+```text
+CLIP patches ─┬─► support patch bank ──────────────► H_base
+              └─► component maps ─► instances ─► atoms ─► H_logic
+H_final = 1 - (1 - H_base) * (1 - lambda * H_logic)
+score_final = score_base + beta * score_logic
+```
+
+Rules are generated automatically by Qwen3-VL; there are no category-specific
+constants, templates or hand-written atoms.  The same pipeline runs for all
+five MVTec LOCO classes.
+
+## Historical 2-shot results (MVTec LOCO, 448 input)
+
+The table below predates the strict support-only protocol guard and must not be
+used as the final V5 comparison.  New runs record `protocol`, sample limits and
+the effective symbolic fusion weights in every metrics JSON.
+
+Baseline comparison before/after the dense-feature redesign:
+
+| category | image AUROC old → new | pixel AUROC old → new | pixel AP old → new |
+|---|---:|---:|---:|
+| juice_bottle | 0.743 → **0.837** | 0.880 → **0.914** | 0.307 → **0.504** |
+| breakfast_box | 0.713 → **0.822** | 0.863 → **0.903** | 0.356 → **0.600** |
+| pushpins | 0.584 → **0.602** | 0.637 → **0.687** | 0.050 → **0.076** |
+| screw_bag | 0.614 → 0.591 | 0.639 → **0.684** | 0.104 → **0.114** |
+| splicing_connectors | 0.550 → **0.575** | 0.683 → **0.721** | 0.168 → **0.209** |
+
+With symbolic fusion enabled, `juice_bottle` reaches image AUROC **0.847**.
+The rule branch abstains automatically when its support/query calibration is
+unreliable, so it cannot damage the baseline.
 
 ## Outputs
 
@@ -156,13 +238,19 @@ Every run creates a timestamped directory under the configured results root
 
 The three images per sample match the reference layout: original, GT overlay
 (`_gt.jpg`, red mask), and prediction overlay (`_{method}.jpg`, jet heat-map).
+`visualizations/{category}/{group}_{sample}.png` is a six-panel figure with
+image / GT / baseline / logic / final / final overlay.  A quick
+`visualizations/{category}/_contact_sheet.jpg` is also generated for the final
+runs.
 `results.csv` uses percent values and the same `i_roc, p_roc` naming as the
 reference `Seed_111-results.csv`.
 
 ## Configuration
 
 Numeric constants are centralised in `configs/default.yaml`. The most important
-knobs are `grounding.alpha`, `logic.*`, `fusion.lambda_logic`, `fusion.beta`,
+knobs are `model.feature_layers`, `model.feature_source`, `model.projected_weight`,
+`grounding.alpha`, `logic.min_atom_support_truth`, `logic.support_calibration`,
+`fusion.max_support_logic_noise`, `fusion.image_logic_weight`,
 `evaluation.pixel_eval_size` and `output.*`.
 
 ## Tests

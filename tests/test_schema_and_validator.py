@@ -16,6 +16,11 @@ def test_parse_expression_atoms():
     assert kind == "SpatialRelation"
     assert args == ["Screw", "Slot"]
     assert params == {"relation": "Inside"}
+    assert parse_expression("PositionMatch(Screw,upper_center)") == (
+        "PositionMatch",
+        ["Screw", "upper_center"],
+        {},
+    )
 
 
 def test_roundtrip_rule_kb(tmp_path):

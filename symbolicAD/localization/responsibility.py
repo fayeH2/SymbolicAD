@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Dict, Optional
 
 import numpy as np
+from scipy.ndimage import gaussian_filter
 
 from symbolicAD.config import Config
 from symbolicAD.models.clip_backbone import CLIPBackbone
@@ -54,11 +55,23 @@ def build_logic_heatmap(
         grid_size = (height, width)
     logic_map = np.zeros(grid_size, dtype=np.float32)
 
+    active_failed = None
+    if logic_result is not None:
+        active_failed = set(logic_result.active_failed_atom_ids)
+
     for atom_id, atom_result in atom_results.items():
-        heatmap = build_atom_heatmap(
-            atom_result, rule_kb, patch_features, backbone, config
-        )
+        if active_failed is not None and atom_id not in active_failed:
+            heatmap = np.zeros_like(
+                atom_result.responsibility_map, dtype=np.float32
+            )
+        else:
+            heatmap = build_atom_heatmap(
+                atom_result, rule_kb, patch_features, backbone, config
+            )
         atom_heatmaps[atom_id] = heatmap
         logic_map = 1.0 - (1.0 - logic_map) * (1.0 - heatmap)
 
+    sigma = float(getattr(config.logic, "heatmap_sigma", 0.0))
+    if sigma > 0.0:
+        logic_map = gaussian_filter(logic_map, sigma=sigma, mode="nearest")
     return np.clip(logic_map, 0.0, 1.0).astype(np.float32), atom_heatmaps

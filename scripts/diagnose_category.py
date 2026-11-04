@@ -53,7 +53,12 @@ from symbolicAD.grounding.component_maps import (
     prototype_similarity_map,
     text_similarity_map,
 )
-from symbolicAD.grounding.instance_extractor import extract_instances
+from symbolicAD.grounding.instance_extractor import (
+    component_spatial_prior,
+    extract_instances,
+    image_to_lab_grid,
+    select_instances,
+)
 from symbolicAD.grounding.relation_grounder import evaluate_atoms
 from symbolicAD.grounding.scene_graph import SceneGraph
 from symbolicAD.grounding.support_memory import build_support_memory
@@ -294,6 +299,7 @@ def main() -> None:
         model_name=config.model.clip_model,
         device=config.model.device,
         image_size=config.model.image_size,
+        feature_layers=config.model.feature_layers,
     )
     baseline = build_baseline(backbone, support_images, category, config)
 
@@ -527,7 +533,13 @@ def main() -> None:
             gt_mask = load_gt_mask(sample.mask_path, (image.height, image.width))
 
             scene_graph = _scene_graph(
-                offset, rule_kb, component_maps, support_memory, image_patches, config
+                offset,
+                rule_kb,
+                component_maps,
+                support_memory,
+                image_patches,
+                config,
+                image=image,
             )
             atom_results = evaluate_atoms(
                 scene_graph, rule_kb, support_memory, config, backbone=backbone
@@ -913,21 +925,40 @@ def _baseline_maps(baseline, patches, stats):
     return maps, scored["image_score"]
 
 
-def _scene_graph(offset, rule_kb, component_maps, support_memory, patches, config):
+def _scene_graph(
+    offset, rule_kb, component_maps, support_memory, patches, config, image=None
+):
     scene_graph = SceneGraph(component_maps={}, instances={}, patch_features=patches)
+    color_grid = (
+        image_to_lab_grid(image, scene_graph.grid_size()) if image is not None else None
+    )
     for symbol in rule_kb.components:
         name = symbol.name
         raw = component_maps[name][offset]
         memory = support_memory.components[name]
         normalized = normalize_with_support(raw, memory.score_q_low, memory.score_q_high)
+        if image is not None:
+            prior = component_spatial_prior(
+                image,
+                scene_graph.grid_size(),
+                position=rule_kb.position_for(name),
+                role=symbol.role,
+            )
+            normalized *= prior
+            if "container" in symbol.role.lower():
+                normalized = np.maximum(normalized, 0.6 * prior)
         scene_graph.component_maps[name] = normalized
-        scene_graph.instances[name] = extract_instances(
+        instances = extract_instances(
             component_map=normalized,
             patch_features=patches,
             concept=name,
             threshold=config.grounding.component_threshold,
             min_area=config.grounding.min_instance_area,
             morphology_kernel=config.grounding.morphology_kernel,
+            color_grid=color_grid,
+        )
+        scene_graph.instances[name] = select_instances(
+            instances, rule_kb.count_for(name)
         )
     return scene_graph
 

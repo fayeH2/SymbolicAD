@@ -1,6 +1,6 @@
 dataset: mvtec_loco
 category: ""
-shot: 8
+shot: 2
 seed: 668
 support_seed: 668
 mode: baseline_logic
@@ -9,18 +9,53 @@ max_images_per_group: 0
 model:
   clip_model: hf-hub:timm/vit_base_patch16_clip_224.openai
   device: cuda:0
-  image_size: 224
-  batch_size: 16
+  image_size: 448
+  batch_size: 4
   logit_scale: 100.0
-  baseline: clip_fewshot
+  baseline: clip_adaptive
   knn: 1
   max_bank_size: 0
+  # Preserve aligned component coordinates instead of matching every query
+  # patch against an orderless global support bank only.
+  spatial_radius: 1
+  spatial_weight: 0.5
+  # PromptAD/AnomalyCLIP-style dense feature modelling.  Middle ViT blocks keep
+  # local structure; optional whitening removes CLIP's shared dominant direction.
+  feature_layers: [3, 8, 11]
+  layer_fusion: mean
+  local_radius: 1
+  local_weight: 0.35
+  whiten: false
+  whiten_components: 128
+  whiten_eps: 1.0e-3
+  text_visual_weight: 0.0
+  text_visual_fusion: harmonic
+  foreground_masking: true
+  foreground_soft: 0.35
+  # Support-calibrated top-k image statistic.  Top-1% is used for the
+  # multi-layer map; top-5% is more robust for the projected fallback.
+  image_score_percent: 1.0
+  image_text_weight: 0.1
+  image_global_weight: 0.0
+  # Strict 2-shot FSAD uses a fixed feature source. "auto" inspects the query
+  # score distribution and is permitted only when evaluation.allow_transductive
+  # is explicitly enabled for a separately reported transductive ablation.
+  feature_source: both
+  projected_weight: 0.25
+  auto_select_samples: 120
+  # Only leave the simple projected baseline when a more complex candidate is
+  # clearly more separable (relative Otsu margin).  This keeps small-object
+  # categories on the stable projected space.
+  auto_margin: 0.08
+  normalise_layers: false
 
 grounding:
   alpha: 0.5
   component_threshold: 0.55
-  min_instance_area: 8
-  morphology_kernel: 3
+  # Component extraction runs on a 14x14 grid; 8 patches erases small labels.
+  min_instance_area: 2
+  # The CLIP grid is only 14x14; a 3x3 opening erases small normal labels.
+  morphology_kernel: 1
   support_quantile_low: 0.50
   support_quantile_high: 0.99
   max_prototypes_per_component: 32
@@ -36,9 +71,16 @@ logic:
   spatial_temperature: 1.0
   eta: 0.5
   rescore_temperature: 0.07
+  color_sigma: 0.18
   fail_threshold: 0.5
   and_epsilon: 1.0e-6
   rescore_enabled: false
+  support_calibration: true
+  min_atom_support_truth: 0.55
+  heatmap_sigma: 0.8
+  soft_responsibility: true
+  calibration_min_gap: 0.10
+  attribute_min_gap: 0.05
 
 qwen:
   enabled: true
@@ -57,15 +99,29 @@ compiler:
   repair_counts: false
   repair_relation_direction: false
   add_missing_counts: false
+  disable_inconsistent_atoms: true
   stable_count_std: 0.5
   count_in_range_sigma: 1.0
   max_count_range_width: 6
+  min_attribute_support_score: 0.05
 
 fusion:
-  lambda_logic: 0.1
-  beta: 0.1
+  # Pixel fusion is attempted only when support/query calibration passes;
+  # otherwise the symbolic branch abstains.  The image residual is controlled
+  # by image_logic_weight below.
+  lambda_logic: 0.25
+  beta: 0.0
   topk_percent: 1.0
   map_epsilon: 1.0e-6
+  # Scale the above by support-estimated reliability; unreliable rule banks
+  # automatically abstain instead of damaging the baseline.
+  auto_from_support: true
+  min_reliability: 0.55
+  min_coverage: 0.35
+  max_support_logic_noise: 0.12
+  image_logic_weight: 0.02
+  image_logic_scale: 1.0
+  max_support_image_noise: 0.30
 
 evaluation:
   pixel_eval_size: 256
@@ -73,6 +129,7 @@ evaluation:
   pro_fpr_limit: 0.30
   pro_thresholds: 64
   enable_pro: true
+  allow_transductive: false
 
 output:
   save_maps: true

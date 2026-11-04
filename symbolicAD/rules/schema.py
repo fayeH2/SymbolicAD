@@ -16,6 +16,7 @@ ALLOWED_ATOM_KINDS = (
     "CountRatio",
     "OneToOne",
     "SpatialRelation",
+    "PositionMatch",
     "AttributeMatch",
 )
 
@@ -87,7 +88,9 @@ class RelationAtom:
     @property
     def components(self) -> List[str]:
         """Return only the arguments that reference component symbols."""
-        if self.kind in {"Exist", "CountEq", "CountInRange", "AttributeMatch"}:
+        if self.kind in {
+            "Exist", "CountEq", "CountInRange", "PositionMatch", "AttributeMatch"
+        }:
             return [str(self.args[0])] if self.args else []
         if self.kind in {"CountRatio", "OneToOne", "SpatialRelation"}:
             return [str(value) for value in self.args[:2]]
@@ -102,6 +105,12 @@ class RelationAtom:
     @property
     def attribute(self) -> Optional[str]:
         if self.kind == "AttributeMatch" and len(self.args) >= 2:
+            return str(self.args[1])
+        return None
+
+    @property
+    def position_region(self) -> Optional[str]:
+        if self.kind == "PositionMatch" and len(self.args) >= 2:
             return str(self.args[1])
         return None
 
@@ -240,6 +249,31 @@ class RuleKB:
         if not prompts:
             prompts = [component.replace("_", " ")]
         return prompts
+
+    def position_for(self, component: str) -> str:
+        """Return the coarse Qwen position encoded by PositionMatch."""
+        for atom in self.atoms:
+            if (
+                atom.kind == "PositionMatch"
+                and atom.components
+                and atom.components[0] == component
+            ):
+                return atom.position_region or ""
+        return ""
+
+    def count_for(self, component: str) -> Optional[int]:
+        """Return a positive exact count declared for a component, if any."""
+        for atom in self.atoms:
+            if (
+                atom.kind == "CountEq"
+                and atom.components
+                and atom.components[0] == component
+                and len(atom.args) >= 2
+            ):
+                value = float(atom.args[1])
+                if value > 0 and value.is_integer():
+                    return int(value)
+        return None
 
     def atom_prompts(self, atom_id: str) -> Dict[str, str]:
         atom = self.atom(atom_id)
@@ -397,6 +431,11 @@ def parse_expression(expression: str) -> tuple[str, List[Any], Dict[str, Any]]:
     elif name == "OneToOne":
         if len(args) != 2:
             raise RuleSchemaError("OneToOne expects (A, B)")
+    elif name == "PositionMatch":
+        if len(args) != 2:
+            raise RuleSchemaError("PositionMatch expects (Component, region)")
+        if not str(args[0]).strip() or not str(args[1]).strip():
+            raise RuleSchemaError("PositionMatch requires component and region")
     elif name == "AttributeMatch":
         if len(args) != 3:
             raise RuleSchemaError("AttributeMatch expects (Component, attribute, value)")

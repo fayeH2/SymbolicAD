@@ -106,6 +106,9 @@ def validate_rule_kb(rule_kb: RuleKB) -> tuple[RuleKB, ValidationReport]:
             if not atom.attribute or not atom.attribute_value:
                 report.add(f"atom {atom.atom_id!r} has an empty attribute/value")
                 atom.weight = 0.0
+        if atom.kind == "PositionMatch" and not atom.position_region:
+            report.add(f"atom {atom.atom_id!r} has an empty position region")
+            atom.weight = 0.0
 
         atom.weight = min(1.0, max(0.0, float(atom.weight)))
         if atom.weight == 0.0:
@@ -135,6 +138,8 @@ def validate_against_support(
     count_tolerance: float = 0.5,
     ratio_tolerance: float = 0.5,
     disable_on_mismatch: bool = False,
+    min_attribute_support_score: float = 0.05,
+    min_atom_support_truth: float = 0.55,
 ) -> ValidationReport:
     """Report or disable count atoms that contradict normal support evidence.
 
@@ -195,6 +200,44 @@ def validate_against_support(
                 if disable_on_mismatch:
                     atom.weight = 0.0
                     report.dropped_atoms.append(atom.atom_id)
+        elif atom.kind == "AttributeMatch":
+            stats = support_memory.attribute_stats.get(atom.atom_id, {})
+            median = stats.get("q50")
+            if median is None:
+                message = f"{atom.expression} has no grounded support evidence"
+                report.add(message)
+                if disable_on_mismatch:
+                    atom.weight = 0.0
+                    report.dropped_atoms.append(atom.atom_id)
+            elif float(median) < float(min_attribute_support_score):
+                message = (
+                    f"{atom.expression} support grounding score {float(median):.4g} "
+                    f"is below {float(min_attribute_support_score):.4g}"
+                )
+                report.add(message)
+                if disable_on_mismatch:
+                    atom.weight = 0.0
+                    report.dropped_atoms.append(atom.atom_id)
+
+    atom_stats = getattr(support_memory, "atom_stats", {}) or {}
+    for atom in rule_kb.atoms:
+        if atom.weight <= 0 or atom.kind == "AttributeMatch":
+            continue
+        stats = atom_stats.get(atom.atom_id)
+        if not stats:
+            continue
+        median = float(stats.get("q50", 1.0))
+        support_failure = float(stats.get("support_failure_rate", 0.0))
+        if median < float(min_atom_support_truth) or support_failure > 0.5:
+            message = (
+                f"{atom.expression} normal-support truth {median:.3f}, "
+                f"leave-one-out failure rate {support_failure:.2f} "
+                f"(grounding failure)"
+            )
+            report.add(message)
+            if disable_on_mismatch:
+                atom.weight = 0.0
+                report.dropped_atoms.append(atom.atom_id)
 
     for atom_id in rule_kb.formula.atom_ids():
         atom = rule_kb.atom(atom_id)

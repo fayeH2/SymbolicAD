@@ -43,6 +43,7 @@ def main() -> None:
         model_name=config.model.clip_model,
         device=config.model.device,
         image_size=config.model.image_size,
+        feature_layers=config.model.feature_layers,
     )
     try:
         for category in categories:

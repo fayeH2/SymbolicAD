@@ -35,6 +35,14 @@ def test_or_and_not():
     assert abs(execute_formula(not_node, results).root_truth - 0.8) < 1e-5
 
 
+def test_satisfied_or_does_not_report_inactive_alternative():
+    results = {"A": _result("A", 0.9), "B": _result("B", 0.1)}
+    formula = LogicNode(op="OR", children=[LogicNode.leaf("A"), LogicNode.leaf("B")])
+    out = execute_formula(formula, results, fail_threshold=0.5)
+    assert out.active_failed_atom_ids == []
+    assert out.failed_atoms == []
+
+
 def test_disabled_atom_is_neutral():
     results = {"A": _result("A", 0.0, weight=0.0, valid=False)}
     formula = LogicNode(op="AND", children=[LogicNode.leaf("A")])

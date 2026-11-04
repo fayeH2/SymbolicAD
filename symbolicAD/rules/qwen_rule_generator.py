@@ -11,6 +11,7 @@ the pipeline consumes cached JSON, so query-time inference never calls the LLM.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -19,12 +20,16 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from .schema import ComponentSymbol, LogicNode, RelationAtom, RuleKB
 
 DEFAULT_TEMPLATE_DIR = Path(__file__).resolve().parents[2] / "configs" / "rules"
-QWEN_PROMPT_VERSION = "v1"
+QWEN_PROMPT_VERSION = "v5_indexed_support_images"
 
 _SPATIAL = {"Inside", "LeftOf", "RightOf", "Above", "Below", "CenterAligned"}
 _PLACEHOLDERS = {
     "parentorempty", "camelcase", "child", "parent", "name", "component",
-    "componentname", "shortrole", "shortprompt", "max2shortprompts",
+    "componentname", "shortrole", "shortprompt", "max2shortprompts", "empty",
+}
+_COMMON_COLOUR_WORDS = {
+    "black", "white", "red", "brown", "orange", "yellow", "green", "blue",
+    "purple", "pink", "gray", "grey", "clear", "transparent",
 }
 
 
@@ -76,12 +81,14 @@ def _expand_split_groups(value):
 
 
 def _close_truncated_json(text: str) -> str:
-    """Best-effort closing of a truncated JSON object."""
+    """Best-effort repair of truncated or mismatched JSON delimiters."""
     in_string = False
     escape = False
     stack: List[str] = []
+    repaired: List[str] = []
     for char in text:
         if in_string:
+            repaired.append(char)
             if escape:
                 escape = False
             elif char == "\\":
@@ -91,15 +98,24 @@ def _close_truncated_json(text: str) -> str:
             continue
         if char == '"':
             in_string = True
+            repaired.append(char)
         elif char in "{[":
             stack.append(char)
-        elif char in "}]" and stack:
+            repaired.append(char)
+        elif char in "}]":
+            if not stack:
+                # Ignore a trailing closer with no corresponding opener.
+                continue
+            expected = "}" if stack[-1] == "{" else "]"
+            repaired.append(char if char == expected else expected)
             stack.pop()
+        else:
+            repaired.append(char)
     if in_string:
-        text += '"'
+        repaired.append('"')
     for opener in reversed(stack):
-        text += "}" if opener == "{" else "]"
-    return text
+        repaired.append("}" if opener == "{" else "]")
+    return "".join(repaired)
 
 
 def _extract_json(raw: str, prefix: str = "") -> Dict[str, Any]:
@@ -131,6 +147,8 @@ def _sanitise_name(name: str, fallback: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9_]", "", str(name).replace(" ", "_"))
     if not cleaned:
         cleaned = fallback
+    if not cleaned:
+        return ""
     if cleaned[0].isdigit():
         cleaned = "C" + cleaned
     return cleaned[:48]
@@ -154,7 +172,11 @@ def _string_list(value: Any) -> List[str]:
     return result
 
 
-def repair_description(description: Dict[str, Any], category: str) -> Dict[str, Any]:
+def repair_description(
+    description: Dict[str, Any],
+    category: str,
+    max_variants: int = 4,
+) -> Dict[str, Any]:
     """Make Qwen's structured description internally consistent."""
     components: List[Dict[str, Any]] = []
     by_name: Dict[str, Dict[str, Any]] = {}
@@ -184,29 +206,16 @@ def repair_description(description: Dict[str, Any], category: str) -> Dict[str, 
             "role": str(item.get("role", "")).strip(),
             "part_of": _sanitise_name(item.get("part_of", ""), ""),
             "prompts": prompts,
+            "position": str(item.get("position", "")).strip().lower().replace(" ", "_"),
             "count": count,
             "count_range": count_range,
         }
         components.append(entry)
         by_name[name] = entry
 
-    # Add parents referenced by part_of but omitted by the model.
-    for entry in list(components):
-        parent = entry["part_of"]
-        if not parent or parent in by_name or parent.lower() in _PLACEHOLDERS:
-            if parent.lower() in _PLACEHOLDERS:
-                entry["part_of"] = ""
-            continue
-        parent_entry = {
-            "name": parent,
-            "role": "container",
-            "part_of": "",
-            "prompts": [f"a {parent.replace('_', ' ')}", f"the {parent.replace('_', ' ')} in the scene"],
-            "count": None,
-            "count_range": None,
-        }
-        components.insert(0, parent_entry)
-        by_name[parent] = parent_entry
+    # Never turn an unknown parent token into a visible component.  With only
+    # a few support images this converts an LLM schema placeholder (for example
+    # ``Empty``) into a hallucinated object and then grounds rules to it.
     for entry in components:
         if entry["part_of"] and entry["part_of"] not in by_name:
             entry["part_of"] = ""
@@ -240,8 +249,9 @@ def repair_description(description: Dict[str, Any], category: str) -> Dict[str, 
     # Attribute variants: flatten duplicate keys and rename collisions.
     variants: List[Dict[str, Any]] = []
     seen_variants = set()
+    variant_limit = max(0, min(4, int(max_variants)))
     for group_index, item in enumerate(description.get("attribute_variants", []) or []):
-        if len(variants) >= 6:
+        if len(variants) >= variant_limit:
             break
         if not isinstance(item, dict):
             continue
@@ -299,12 +309,39 @@ def repair_description(description: Dict[str, Any], category: str) -> Dict[str, 
 # --------------------------------------------------------------------------- #
 # Description -> executable RuleKB
 # --------------------------------------------------------------------------- #
-def build_rule_kb_from_description(description: Dict[str, Any], category: str) -> RuleKB:
-    description = repair_description(description, category)
+def build_rule_kb_from_description(
+    description: Dict[str, Any],
+    category: str,
+    max_variants: int = 4,
+) -> RuleKB:
+    description = repair_description(description, category, max_variants=max_variants)
+    attribute_terms = {
+        str(condition.get("value", "")).strip().lower()
+        for variant in description["attribute_variants"]
+        for condition in variant.get("conditions", [])
+        if str(condition.get("value", "")).strip()
+    }
+    colour_terms = set(_COMMON_COLOUR_WORDS)
+
+    def neutral_prompts(item: Dict[str, Any]) -> List[str]:
+        phrase = re.sub(r"(?<!^)(?=[A-Z])", " ", item["name"]).replace("_", " ").lower()
+        role = str(item.get("role", "")).strip().lower()
+        generic = [f"a {phrase}"]
+        if role and role != phrase.lower():
+            generic.append(f"the {role} of the {category.replace('_', ' ')}")
+        for prompt in item.get("prompts", []):
+            lowered = str(prompt).lower()
+            if any(term and term in lowered for term in attribute_terms):
+                continue
+            if any(term in lowered.split() for term in colour_terms):
+                continue
+            generic.append(str(prompt))
+        return _string_list(generic)[:3]
+
     components = [
         ComponentSymbol(
             name=item["name"],
-            prompts=item["prompts"],
+            prompts=neutral_prompts(item),
             role=item.get("role", ""),
             part_of=item.get("part_of", ""),
         )
@@ -335,7 +372,20 @@ def build_rule_kb_from_description(description: Dict[str, Any], category: str) -
                     violation_prompt=f"wrong number of {name}",
                 )
             )
-        elif isinstance(count, int) and count > 0:
+
+        position = str(item.get("position", "")).strip()
+        if position:
+            atoms.append(
+                RelationAtom(
+                    atom_id=next_id(),
+                    expression=f"PositionMatch({name},{position})",
+                    kind="PositionMatch",
+                    args=[name, position],
+                    normal_prompt=f"{name} at the normal {position} position",
+                    violation_prompt=f"{name} displaced from its normal position",
+                )
+            )
+        if count_range is None and isinstance(count, int) and count > 0:
             atoms.append(
                 RelationAtom(
                     atom_id=next_id(),
@@ -431,7 +481,7 @@ def build_rule_kb_from_description(description: Dict[str, Any], category: str) -
 # Qwen backend
 # --------------------------------------------------------------------------- #
 def _rule_generation_prompt(category: str, image_count: int) -> str:
-    return f"""Inspect these {image_count} normal support images of ONE product category and describe its normal structure as compact JSON.
+    return f"""Inspect these {image_count} numbered normal support images of ONE product category and describe its normal structure as compact JSON.
 
 Product category: {category}
 
@@ -441,27 +491,31 @@ Schema:
 {{
  "category": "{category}",
  "components": [
-   {{"name":"CamelCase","role":"short role","part_of":"ParentOrEmpty","prompts":["max 2 short prompts"],"count":1,"count_range":null}}
+   {{"name":"CamelCase","role":"short role","part_of":"","position":"top|upper_center|center|lower_center|bottom|left|right","prompts":["max 2 short prompts"],"count":1,"count_range":null}}
  ],
  "relations": [
    {{"type":"Inside|Above|Below|LeftOf|RightOf|CenterAligned","a":"Child","b":"Parent"}}
  ],
  "attribute_variants": [
    {{"group":"variant","conditions":[
-     {{"component":"Name","attribute":"fruit","value":"orange","prompts":["max 2 prompts"]}},
-     {{"component":"Name","attribute":"color","value":"yellow","prompts":["max 2 prompts"]}}
+     {{"component":"Name","attribute":"fruit","value":"observed fruit name","prompts":["max 2 prompts"]}},
+     {{"component":"Name","attribute":"color","value":"observed canonical colour","prompts":["max 2 prompts"]}}
    ]}}
  ]
 }}
 
 Strict requirements:
-- List every important visible part, including the main container, closures and labels.
+- List only important parts directly visible in these support images, including the main container and labels.
+- Do not infer a cap or closure from a threaded/open bottle neck. Include a Cap only if it visibly covers the opening.
 - Separate visually distinct parts with different roles into separate components.
 - Separate a large picture/fruit label from a small text label into two components.
+- Component prompts must describe identity/role and be invariant across normal variants. Put fruit names and liquid colours only in attribute_variants, never in component prompts.
+- Use an empty string for part_of when a component has no visible parent. Never output a component named Empty.
 - Counts must be visible integers. Use count_range [low, high] only when the count really varies.
-- Relations must include containment (Inside child parent) and the vertical order of the two labels. In image coordinates, the component higher up is Above the lower component. Include each relation only once.
-- attribute_variants: ONLY for valid normal appearance combinations (e.g. fruit type and liquid colour). The support images may show several valid variants; enumerate ALL distinct fruit/colour combinations you can see (for example cherry+red, banana+white, orange+yellow). At most 4 unique entries. Each entry MUST be a separate object in the array; never repeat the same variant and never repeat the group key inside one object. Put fruit attributes on the fruit-label component and colour attributes on the Liquid component. Do NOT add texture, clarity, material, background, border, font, shape, size or position attributes.
-- Never copy schema placeholders (ParentOrEmpty, CamelCase, Child, Parent, Name, ComponentName, short role, max 2 prompts) into the output.
+- Give each component a coarse absolute position. Position is descriptive; exact normal geometry will be calibrated from support images.
+- Use part_of for containment. In relations, add only directly visible directional relations such as the vertical order of two labels. In image coordinates, the component higher up is Above the lower component. Include each relation only once.
+- Before writing attribute_variants, compare Normal support image 1 through Normal support image {image_count} one by one. ONLY emit appearance combinations directly observed in those images. Emit one entry per distinct observed combination (at most {min(4, image_count)}) and never complete a possible product catalogue from prior knowledge. Each entry MUST correspond to an observed support image, be a separate object in the array, and use a unique group key. Put fruit attributes on the fruit-label component and colour attributes on the Liquid component. Use simple canonical colour words. Do NOT add texture, clarity, material, background, border, font, shape, size or position attributes.
+- Never copy schema placeholders (CamelCase, Child, Parent, Name, ComponentName, short role, max 2 prompts) into the output.
 - Do not describe scratches, dirt, contamination or breakage.
 - Keep prompts short.
 - Valid JSON only, no markdown, no extra keys. Output the JSON immediately."""
@@ -498,21 +552,33 @@ class QwenVLBackend:
         self.max_new_tokens = int(max_new_tokens)
         self.model_path = str(model_path)
         self.processor = AutoProcessor.from_pretrained(self.model_path)
+        # ``device_map`` is an Accelerate feature and made the otherwise local
+        # Qwen path fail in lean inference environments where Accelerate is not
+        # installed.  A single 8B model fits on the configured 24 GB device, so
+        # construct it normally and move it explicitly instead of introducing
+        # an undeclared runtime dependency.
         self.model = Qwen3VLForConditionalGeneration.from_pretrained(
             self.model_path,
             dtype=torch.bfloat16,
-            device_map=device,
-        )
+        ).to(self.device)
         self.model.eval()
 
     def generate(self, category: str, support_images: Sequence) -> str:
         images = _resize_support(support_images, self.max_image_side)
         prompt_text = _rule_generation_prompt(category, len(images))
+        content = []
+        for index, image in enumerate(images, start=1):
+            content.extend(
+                [
+                    {"type": "text", "text": f"Normal support image {index}:"},
+                    {"type": "image", "image": image},
+                ]
+            )
+        content.append({"type": "text", "text": prompt_text})
         messages = [
             {
                 "role": "user",
-                "content": [{"type": "image", "image": image} for image in images]
-                + [{"type": "text", "text": prompt_text}],
+                "content": content,
             },
             {
                 "role": "assistant",
@@ -573,23 +639,41 @@ def generate_rules_with_qwen(
     rule_path = cache_dir / f"{stem}.json"
     raw_path = cache_dir / f"{stem}.raw.txt"
     description_path = cache_dir / f"{stem}.description.json"
+    support_signature = _support_image_signature(support_images)
+    support_seed = int(getattr(config, "support_seed", getattr(config, "seed", 0)))
 
     if rule_path.is_file() and not force:
-        return RuleKB.load(rule_path)
+        cached = RuleKB.load(rule_path)
+        metadata = cached.metadata
+        cache_matches = (
+            metadata.get("prompt_version") == QWEN_PROMPT_VERSION
+            and metadata.get("support_shot") == shot
+            and metadata.get("support_seed") == support_seed
+            and metadata.get("support_signature") == support_signature
+            and metadata.get("qwen_model") == str(config.qwen.model_path)
+        )
+        if cache_matches:
+            return cached
 
     backend = get_backend(config)
     raw = backend.generate(category, support_images)
     raw_path.write_text(raw, encoding="utf-8")
     try:
         description = _extract_json(raw)
-        rule_kb = build_rule_kb_from_description(description, category)
+        rule_kb = build_rule_kb_from_description(
+            description,
+            category,
+            max_variants=min(4, len(support_images)),
+        )
     except Exception as exc:
         raise QwenRuleGenerationError(
             f"Qwen rule generation failed for {category}; raw response saved to {raw_path}: {exc}"
         ) from exc
 
-    rule_kb.metadata["support_images"] = [str(path) for path in support_images]
     rule_kb.metadata["support_shot"] = shot
+    rule_kb.metadata["support_seed"] = support_seed
+    rule_kb.metadata["support_signature"] = support_signature
+    rule_kb.metadata["qwen_model"] = str(config.qwen.model_path)
     rule_kb.metadata["raw_response_path"] = str(raw_path)
     description_path.write_text(
         json.dumps(rule_kb.metadata["description"], ensure_ascii=False, indent=2) + "\n",
@@ -597,6 +681,22 @@ def generate_rules_with_qwen(
     )
     rule_kb.save(rule_path)
     return rule_kb
+
+
+def _support_image_signature(support_images: Sequence) -> str:
+    """Content hash used to prevent cross-seed Qwen rule-cache reuse."""
+    import numpy as np
+    from PIL import Image
+
+    digest = hashlib.sha256()
+    for image in support_images:
+        if not isinstance(image, Image.Image):
+            image = Image.fromarray(np.asarray(image)).convert("RGB")
+        else:
+            image = image.convert("RGB")
+        digest.update(str(image.size).encode("ascii"))
+        digest.update(np.asarray(image, dtype=np.uint8).tobytes())
+    return digest.hexdigest()
 
 
 # --------------------------------------------------------------------------- #

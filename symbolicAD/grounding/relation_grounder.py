@@ -19,6 +19,7 @@ from symbolicAD.rules.executor import AtomicResult
 from symbolicAD.rules.schema import RelationAtom, RuleKB
 
 from .geometry import bbox_iou, containment, mahalanobis, pair_feature, pair_geometry
+from .instance_extractor import lab_color_similarity, named_color_lab
 from .scene_graph import ComponentInstance, SceneGraph
 from .support_memory import SupportMemory
 
@@ -35,6 +36,74 @@ def _union_masks(
     for instance in instances:
         result = np.maximum(result, instance.mask.astype(np.float32))
     return result
+
+
+def _weighted_instance_masks(
+    instances: Sequence[ComponentInstance],
+    component_map: Optional[np.ndarray],
+    weights: Sequence[float],
+    grid_size: tuple[int, int],
+) -> np.ndarray:
+    """Soft responsibility: instance support times a continuous violation weight."""
+    result = np.zeros(grid_size, dtype=np.float32)
+    for instance, weight in zip(instances, weights):
+        soft = np.asarray(instance.mask, dtype=np.float32)
+        if component_map is not None:
+            support = np.asarray(component_map, dtype=np.float32)
+            if support.shape == grid_size:
+                soft = soft * (0.25 + 0.75 * np.clip(support, 0.0, 1.0))
+        result = np.maximum(result, np.clip(soft * float(weight), 0.0, 1.0))
+    return result
+
+
+def calibrate_atom_results(
+    atom_results: Dict[str, AtomicResult],
+    support_memory: Optional[SupportMemory],
+    config: Config,
+) -> Dict[str, AtomicResult]:
+    """Convert atom truths into support-relative normalities.
+
+    A raw truth of 0.7 is only a violation if normal support images all scored
+    near 1.0 for the same atom.  This prevents badly grounded LLM rules from
+    flooding every query with false anomalies.
+    """
+    if support_memory is None or not config.logic.support_calibration:
+        return atom_results
+    for atom_id, result in atom_results.items():
+        if not result.valid or result.weight <= 0:
+            continue
+        if result.kind == "AttributeMatch":
+            # Attribute atoms already normalise against q05/q50 support scores.
+            continue
+        stats = support_memory.atom_stats.get(atom_id)
+        if not stats:
+            continue
+        raw = float(result.truth)
+        low = float(stats.get("q05", 0.0))
+        high = float(stats.get("q50", 1.0))
+        gap = high - low
+        if gap < 1e-3:
+            # Deterministic atom on support (e.g. CountEq always true).  Keep
+            # the raw truth; mapping a degenerate gap to zero would erase the
+            # only violation signal these atoms can carry.
+            calibrated = raw
+        elif raw >= high:
+            calibrated = 1.0
+        elif raw <= low:
+            calibrated = 0.0
+        else:
+            width = max(
+                gap,
+                float(getattr(config.logic, "calibration_min_gap", 0.10)),
+            )
+            calibrated = (raw - low) / max(width, 1e-6)
+        result.evidence = dict(result.evidence)
+        result.evidence["raw_truth"] = raw
+        result.evidence["support_q05"] = low
+        result.evidence["support_q50"] = high
+        result.truth = _clip01(calibrated)
+        result.violation = float(1.0 - result.truth)
+    return atom_results
 
 
 def _expected_mask(
@@ -145,7 +214,15 @@ def _evaluate_count_eq(
         extra = ordered[max(int(round(target)), 0):]
         if not extra:
             extra = ordered[-1:]
-        responsibility = _union_masks(extra, grid_size)
+        if config.logic.soft_responsibility:
+            responsibility = _weighted_instance_masks(
+                extra,
+                _component_map(scene_graph, component),
+                [1.0] * len(extra),
+                grid_size,
+            )
+        else:
+            responsibility = _union_masks(extra, grid_size)
         evidence = {
             "estimated_count": estimated,
             "soft_count": soft_count,
@@ -226,7 +303,15 @@ def _evaluate_count_in_range(
         extra = ordered[int(round(high)):]
         if not extra:
             extra = ordered[-1:]
-        responsibility = _union_masks(extra, grid_size)
+        if config.logic.soft_responsibility:
+            responsibility = _weighted_instance_masks(
+                extra,
+                _component_map(scene_graph, component),
+                [1.0] * len(extra),
+                grid_size,
+            )
+        else:
+            responsibility = _union_masks(extra, grid_size)
         evidence = {
             "count": count,
             "low": low,
@@ -266,27 +351,44 @@ def _evaluate_attribute_match(
             },
         )
 
-    if backbone is None:
-        return _result(
-            atom,
-            1.0,
-            np.zeros(grid_size, dtype=np.float32),
-            {
-                "attribute": attribute,
-                "value": value,
-                "unsupported_backbone": True,
-            },
-        )
-
-    embeddings = encode_prompts_cached(
-        backbone,
-        atom.attribute_prompts,
-        cache_dir=config.text_embedding_dir,
-        enabled=config.grounding.text_embedding_cache,
+    color_target = (
+        named_color_lab(value)
+        if attribute.lower() in {"color", "colour"}
+        else None
     )
-    features = np.stack([item.feature for item in instances], axis=0)
-    similarities = features @ embeddings.T
-    per_instance = similarities.max(axis=1)
+    if color_target is not None:
+        per_instance = np.asarray(
+            [
+                lab_color_similarity(
+                    item.color_feature,
+                    color_target,
+                    sigma=float(config.logic.color_sigma),
+                )
+                for item in instances
+            ],
+            dtype=np.float32,
+        )
+    else:
+        if backbone is None:
+            return _result(
+                atom,
+                1.0,
+                np.zeros(grid_size, dtype=np.float32),
+                {
+                    "attribute": attribute,
+                    "value": value,
+                    "unsupported_backbone": True,
+                },
+            )
+        embeddings = encode_prompts_cached(
+            backbone,
+            atom.attribute_prompts,
+            cache_dir=config.text_embedding_dir,
+            enabled=config.grounding.text_embedding_cache,
+        )
+        features = np.stack([item.feature for item in instances], axis=0)
+        similarities = features @ embeddings.T
+        per_instance = similarities.max(axis=1)
     score = float(per_instance.max())
 
     stats: Dict[str, float] = {}
@@ -295,18 +397,41 @@ def _evaluate_attribute_match(
     q05 = stats.get("q05")
     q50 = stats.get("q50")
     if q05 is not None and q50 is not None and float(q50) > float(q05) + 1e-6:
-        truth = _clip01((score - float(q05)) / (float(q50) - float(q05)))
+        if score >= float(q50):
+            truth = 1.0
+        elif score <= float(q05):
+            truth = 0.0
+        else:
+            width = max(
+                float(q50) - float(q05),
+                float(getattr(config.logic, "attribute_min_gap", 0.05)),
+            )
+            truth = _clip01((score - float(q05)) / width)
         threshold = float(q05)
     else:
         truth = _clip01(1.0 / (1.0 + math.exp(-(score - 0.25) / 0.05)))
         threshold = 0.2
 
     failing = [
-        instance
+        (instance, similarity)
         for instance, similarity in zip(instances, per_instance)
         if float(similarity) < threshold
     ]
-    responsibility = _union_masks(failing, grid_size)
+    if failing and config.logic.soft_responsibility:
+        severity = [
+            1.0 - min(1.0, float(similarity) / max(float(threshold), 1e-6))
+            for _, similarity in failing
+        ]
+        responsibility = _weighted_instance_masks(
+            [instance for instance, _ in failing],
+            _component_map(scene_graph, component),
+            severity,
+            grid_size,
+        )
+    else:
+        responsibility = _union_masks(
+            [instance for instance, _ in failing], grid_size
+        )
     if not responsibility.any() and truth < config.logic.fail_threshold:
         responsibility = _component_map(scene_graph, component)
 
@@ -321,7 +446,81 @@ def _evaluate_attribute_match(
             "per_instance_scores": [float(item) for item in per_instance],
             "q05": q05,
             "q50": q50,
+            "grounding": "lab_color" if color_target is not None else "clip_attribute",
             "missing": False,
+        },
+    )
+
+
+def _evaluate_position_match(
+    atom: RelationAtom,
+    scene_graph: SceneGraph,
+    support_memory: Optional[SupportMemory],
+    config: Config,
+) -> AtomicResult:
+    component = atom.components[0]
+    region = atom.position_region or "normal"
+    instances = scene_graph.instances_for(component)
+    grid_size = scene_graph.grid_size()
+    expected = _expected_mask(support_memory, component, grid_size)
+    if not instances:
+        return _result(
+            atom,
+            0.0,
+            expected,
+            {
+                "region": region,
+                "count": 0,
+                "missing": True,
+                "localized": bool(expected.any()),
+            },
+        )
+
+    scale = max(float(expected.max()), 1e-6)
+    scores = []
+    for instance in instances:
+        mask = np.asarray(instance.mask, dtype=np.float32)
+        denominator = max(float(mask.sum()), 1e-6)
+        scores.append(_clip01(float((expected * mask).sum()) / denominator / scale))
+    truth = float(np.mean(scores)) if scores else 0.0
+    failing = [
+        (instance, score)
+        for instance, score in zip(instances, scores)
+        if score < config.logic.fail_threshold
+    ]
+    if failing and config.logic.soft_responsibility:
+        severity = [
+            1.0 - min(
+                1.0, float(score) / max(float(config.logic.fail_threshold), 1e-6)
+            )
+            for _, score in failing
+        ]
+        responsibility = _weighted_instance_masks(
+            [instance for instance, _ in failing],
+            _component_map(scene_graph, component),
+            severity,
+            grid_size,
+        )
+    else:
+        responsibility = _union_masks(
+            [instance for instance, _ in failing], grid_size
+        )
+    if truth < config.logic.fail_threshold:
+        covered = _union_masks(instances, grid_size)
+        responsibility = np.maximum(
+            responsibility,
+            np.clip(expected - covered, 0.0, 1.0),
+        )
+    return _result(
+        atom,
+        truth,
+        responsibility,
+        {
+            "region": region,
+            "count": len(instances),
+            "position_scores": scores,
+            "missing": False,
+            "expected_mass": float(expected.sum()),
         },
     )
 
@@ -570,14 +769,32 @@ def _evaluate_spatial(
 
     truth = _clip01(float(np.mean(best_scores)))
     failing = [
-        instance
+        (instance, score)
         for instance, score in zip(instances_a, best_scores)
         if score < config.logic.fail_threshold
     ]
-    responsibility = _union_masks(failing, grid_size)
-    if 1.0 - truth > 1e-3:
-        expected = _expected_mask(support_memory, component_b, grid_size)
-        responsibility = np.maximum(responsibility, expected * (1.0 - truth))
+    if failing and config.logic.soft_responsibility:
+        severity = [
+            1.0 - min(
+                1.0, float(score) / max(float(config.logic.fail_threshold), 1e-6)
+            )
+            for _, score in failing
+        ]
+        responsibility = _weighted_instance_masks(
+            [instance for instance, _ in failing],
+            _component_map(scene_graph, component_a),
+            severity,
+            grid_size,
+        )
+    else:
+        responsibility = _union_masks(
+            [instance for instance, _ in failing], grid_size
+        )
+    if not responsibility.any() and truth < config.logic.fail_threshold:
+        # The source component A is the subject of Relation(A, B).  Projecting
+        # the expected mask of B (often a large container such as Bottle) made
+        # a local relation failure light up most of the object.
+        responsibility = _expected_mask(support_memory, component_a, grid_size)
 
     return _result(
         atom,
@@ -650,6 +867,10 @@ def evaluate_atoms(
         elif atom.kind == "AttributeMatch":
             result = _evaluate_attribute_match(
                 atom, scene_graph, support_memory, config, backbone
+            )
+        elif atom.kind == "PositionMatch":
+            result = _evaluate_position_match(
+                atom, scene_graph, support_memory, config
             )
         elif atom.kind == "CountRatio":
             result = _evaluate_count_ratio(atom, scene_graph, support_memory, config)

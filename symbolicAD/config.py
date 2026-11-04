@@ -17,20 +17,50 @@ import yaml
 class ModelConfig:
     clip_model: str = "hf-hub:timm/vit_base_patch16_clip_224.openai"
     device: str = "cuda:0"
-    image_size: int = 224
-    batch_size: int = 16
+    image_size: int = 448
+    batch_size: int = 4
     logit_scale: float = 100.0
-    baseline: str = "clip_fewshot"
+    baseline: str = "clip_adaptive"
     knn: int = 1
     max_bank_size: int = 0
+    spatial_radius: int = 1
+    spatial_weight: float = 0.5
+    # Dense multi-layer features.  PromptAD/AnomalyCLIP show that middle ViT
+    # blocks are much better for localisation than the final projected layer.
+    # Indices are zero-based over the vision transformer blocks and are capped
+    # automatically for other CLIP backbones.
+    feature_layers: Tuple[int, ...] = (3, 8, 11)
+    layer_fusion: str = "mean"
+    local_radius: int = 1
+    local_weight: float = 0.35
+    whiten: bool = False
+    whiten_components: int = 128
+    whiten_eps: float = 1.0e-3
+    # Textual (normal-vs-damaged prompt) branch.  Fused harmonically with the
+    # visual memory branch as in PromptAD.
+    text_visual_weight: float = 0.0
+    text_visual_fusion: str = "harmonic"
+    foreground_masking: bool = True
+    foreground_soft: float = 0.35
+    image_score_percent: float = 1.0
+    image_text_weight: float = 0.1
+    image_global_weight: float = 0.0
+    # Fixed by support-only protocol. ``auto`` is a transductive ablation
+    # because it inspects the query score distribution and therefore requires
+    # ``evaluation.allow_transductive`` to be enabled explicitly.
+    feature_source: str = "both"
+    projected_weight: float = 0.25
+    auto_select_samples: int = 120
+    auto_margin: float = 0.08
+    normalise_layers: bool = False
 
 
 @dataclass
 class GroundingConfig:
     alpha: float = 0.5
     component_threshold: float = 0.55
-    min_instance_area: int = 8
-    morphology_kernel: int = 3
+    min_instance_area: int = 2
+    morphology_kernel: int = 1
     support_quantile_low: float = 0.50
     support_quantile_high: float = 0.99
     max_prototypes_per_component: int = 32
@@ -48,9 +78,20 @@ class LogicConfig:
     spatial_temperature: float = 1.0
     eta: float = 0.5
     rescore_temperature: float = 0.07
+    color_sigma: float = 0.18
     fail_threshold: float = 0.5
     and_epsilon: float = 1e-6
     rescore_enabled: bool = False
+    # Convert raw atom truths into support-relative normalities.  An atom whose
+    # support truth is already low is a grounding failure, not an anomaly cue.
+    support_calibration: bool = True
+    min_atom_support_truth: float = 0.55
+    heatmap_sigma: float = 0.8
+    soft_responsibility: bool = True
+    # Floor the support gap so two nearly identical support images do not turn
+    # tiny CLIP score fluctuations into full-scale violations.
+    calibration_min_gap: float = 0.10
+    attribute_min_gap: float = 0.05
 
 
 @dataclass
@@ -73,17 +114,33 @@ class CompilerConfig:
     repair_counts: bool = False
     repair_relation_direction: bool = False
     add_missing_counts: bool = False
+    disable_inconsistent_atoms: bool = True
     stable_count_std: float = 0.5
     count_in_range_sigma: float = 1.0
     max_count_range_width: int = 6
+    min_attribute_support_score: float = 0.05
 
 
 @dataclass
 class FusionConfig:
-    lambda_logic: float = 0.1
-    beta: float = 0.1
+    lambda_logic: float = 0.25
+    beta: float = 0.0
     topk_percent: float = 1.0
     map_epsilon: float = 1e-6
+    # Scale the configured fusion weights by support-estimated rule reliability.
+    # A rule bank that already fails on normal support must abstain instead of
+    # painting normal images with false anomalies.
+    auto_from_support: bool = True
+    min_reliability: float = 0.55
+    min_coverage: float = 0.35
+    # Leave-one-out support logic maps must be quiet before pixel fusion is
+    # allowed.  Noisy responsibility maps cannot be rescued by a small lambda.
+    max_support_logic_noise: float = 0.12
+    # Small image-level symbolic residual.  Pixel fusion is gated separately;
+    # this term only shifts the image score and cannot damage the heat-map.
+    image_logic_weight: float = 0.02
+    image_logic_scale: float = 1.0
+    max_support_image_noise: float = 0.30
 
 
 @dataclass
@@ -93,6 +150,9 @@ class EvaluationConfig:
     pro_fpr_limit: float = 0.30
     pro_thresholds: int = 64
     enable_pro: bool = True
+    # Strict FSAD never adapts model/rule choices on the test query set. This
+    # opt-in switch exists only for clearly labelled transductive ablations.
+    allow_transductive: bool = False
 
 
 @dataclass
@@ -120,7 +180,7 @@ class PathsConfig:
 class Config:
     dataset: str = "mvtec_loco"
     category: str = ""
-    shot: int = 4
+    shot: int = 2
     seed: int = 668
     support_seed: int = 668
     mode: str = "baseline_logic"

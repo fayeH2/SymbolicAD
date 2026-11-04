@@ -5,8 +5,11 @@ import numpy as np
 from symbolicAD.config import load_config
 from symbolicAD.grounding.relation_grounder import evaluate_atoms
 from symbolicAD.grounding.scene_graph import ComponentInstance, SceneGraph
+from symbolicAD.grounding.support_memory import ComponentMemory, SupportMemory
+from symbolicAD.grounding.instance_extractor import named_color_lab
 from symbolicAD.rules.compiler import compile_rule_kb
 from symbolicAD.rules.schema import RuleKB, parse_expression
+from symbolicAD.rules.validator import validate_against_support
 
 
 def _memory(expected, std):
@@ -146,3 +149,56 @@ def test_count_in_range_atom():
     results = evaluate_atoms(scene, rule_kb, None, config)
     assert results["R1"].truth == 1.0
     assert results["R1"].evidence["count"] == 2.0
+
+
+def test_support_validation_can_disable_unreliable_count_grounding():
+    rule_kb = RuleKB.from_dict(
+        {
+            "category": "demo",
+            "components": [{"name": "Label", "prompts": ["a label"]}],
+            "atoms": [{"id": "R1", "expression": "CountEq(Label,1)"}],
+            "formula": {"op": "AND", "children": ["R1"]},
+        }
+    )
+    support = _support(Label=_memory(2.5, 0.2))
+    report = validate_against_support(
+        rule_kb, support, disable_on_mismatch=True
+    )
+    assert report.dropped_atoms == ["R1"]
+    assert rule_kb.atom("R1").weight == 0.0
+
+
+def test_position_and_color_atoms_localize_failed_component():
+    config = load_config()
+    rule_kb = RuleKB.from_dict(
+        {
+            "category": "demo",
+            "components": [{"name": "Label", "prompts": ["a red label"]}],
+            "atoms": [
+                {"id": "P", "expression": "PositionMatch(Label,upper_center)"},
+                {"id": "C", "expression": "AttributeMatch(Label,color,red)"},
+            ],
+            "formula": {"op": "AND", "children": ["P", "C"]},
+        }
+    )
+    mask = np.zeros((4, 4), dtype=np.uint8)
+    mask[2:4, 2:4] = 1
+    instance = _instance("Label_00", mask)
+    instance.color_feature = named_color_lab("blue")
+    expected = np.zeros((4, 4), dtype=np.float32)
+    expected[0:2, 1:3] = 1.0
+    support = SupportMemory(
+        category="demo",
+        grid_size=(4, 4),
+        components={"Label": ComponentMemory(name="Label", expected_mask=expected)},
+    )
+    scene = SceneGraph(
+        component_maps={"Label": mask.astype(np.float32)},
+        instances={"Label": [instance]},
+        patch_features=np.ones((4, 4, 4), dtype=np.float32),
+    )
+    results = evaluate_atoms(scene, rule_kb, support, config, backbone=None)
+    assert results["P"].truth < config.logic.fail_threshold
+    assert results["P"].responsibility_map.sum() > 0
+    assert results["C"].truth < config.logic.fail_threshold
+    assert results["C"].evidence["grounding"] == "lab_color"

@@ -47,7 +47,7 @@ class RunLayout:
         base_dir = Path(base_dir).expanduser()
         timestamped = True if config is None else bool(config.output.timestamped)
         if timestamped:
-            stamp = timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
+            stamp = timestamp or datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             shot = getattr(config, "shot", None) if config is not None else None
             name = f"{stamp}_k{shot}" if shot else stamp
             root = base_dir / name
@@ -200,4 +200,16 @@ def save_run_checkpoint(
             shutil.copyfile(
                 memory,
                 layout.checkpoint_dir / f"{category}_support_memory_k{config.shot}.npz",
+            )
+        compiled = config.rule_cache_dir / f"{category}.compiled.json"
+        if compiled.is_file():
+            shutil.copyfile(
+                compiled,
+                layout.checkpoint_dir / f"{category}_rules.compiled.json",
+            )
+        compile_report = config.rule_cache_dir / f"{category}.compiled.compile.json"
+        if compile_report.is_file():
+            shutil.copyfile(
+                compile_report,
+                layout.checkpoint_dir / f"{category}_rules.compile_report.json",
             )

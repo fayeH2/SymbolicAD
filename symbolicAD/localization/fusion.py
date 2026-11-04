@@ -34,7 +34,10 @@ def fuse_maps(
 ) -> np.ndarray:
     base_map = np.clip(np.asarray(base_map, dtype=np.float32), 0.0, 1.0)
     logic_map = np.clip(np.asarray(logic_map, dtype=np.float32), 0.0, 1.0)
-    fused = 1.0 - (1.0 - base_map) * (1.0 - float(lambda_logic) * logic_map)
+    weight = float(min(1.0, max(0.0, lambda_logic)))
+    if weight == 0.0:
+        return base_map.copy()
+    fused = 1.0 - (1.0 - base_map) * (1.0 - weight * logic_map)
     return np.clip(fused, 0.0, 1.0).astype(np.float32)
 
 
@@ -51,6 +54,33 @@ def final_image_score(
     baseline_score: float,
     logic_score: float,
     beta: float = 0.5,
+    baseline_scale: float | None = None,
 ) -> float:
     beta = float(min(1.0, max(0.0, beta)))
+    if baseline_scale is not None:
+        # Residual supplementation in units of the normal support score range.
+        # This avoids mixing a small raw distance score directly with a [0, 1]
+        # logic score and preserves the baseline exactly when logic abstains.
+        scale = max(0.0, float(baseline_scale))
+        return float(float(baseline_score) + beta * scale * float(logic_score))
     return float((1.0 - beta) * float(baseline_score) + beta * float(logic_score))
+
+
+def normalize_logic_map(
+    logic_map: np.ndarray,
+    logic_stats: dict | None,
+    epsilon: float = 1e-6,
+) -> np.ndarray:
+    """Support-calibrated logic map normalisation.
+
+    Normal support images define the noise floor of the rule branch.  Values
+    below that floor are suppressed, so a query is only enhanced where its rule
+    evidence exceeds the normal-support range.
+    """
+    values = np.asarray(logic_map, dtype=np.float32)
+    if not logic_stats:
+        return np.clip(values, 0.0, 1.0)
+    low = float(logic_stats.get("q_low", 0.0))
+    high = float(logic_stats.get("q_high", 1.0))
+    high = max(high, low + float(epsilon), 0.02)
+    return np.clip((values - low) / (high - low), 0.0, 1.0).astype(np.float32)

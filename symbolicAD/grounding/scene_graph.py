@@ -18,6 +18,9 @@ class ComponentInstance:
     bbox: tuple                  # (x0, y0, x1, y1) normalised
     center: tuple                # (cx, cy) normalised
     area: float                  # fraction of the patch grid
+    color_feature: np.ndarray = field(
+        default_factory=lambda: np.zeros(3, dtype=np.float32)
+    )                            # mean CIE-Lab colour, normalised to [0, 1]
 
     def to_dict(self) -> dict:
         return {
@@ -27,6 +30,7 @@ class ComponentInstance:
             "bbox": [float(value) for value in self.bbox],
             "center": [float(value) for value in self.center],
             "area": float(self.area),
+            "color_feature": [float(value) for value in self.color_feature],
         }
 
 

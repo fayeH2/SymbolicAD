@@ -42,6 +42,7 @@ class LogicResult:
     logic_score: float
     failed_atoms: List[Dict[str, object]]
     atom_truths: Dict[str, float]
+    active_failed_atom_ids: List[str] = field(default_factory=list)
     node_trace: Dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, object]:
@@ -49,6 +50,7 @@ class LogicResult:
             "root_truth": float(self.root_truth),
             "logic_score": float(self.logic_score),
             "failed_atoms": _jsonable(self.failed_atoms),
+            "active_failed_atom_ids": list(self.active_failed_atom_ids),
             "atom_truths": {key: float(value) for key, value in self.atom_truths.items()},
             "node_trace": _jsonable(self.node_trace),
         }
@@ -77,7 +79,12 @@ def _leaf_truth(atom_id: str, atom_results: Mapping[str, AtomicResult]) -> float
     if not result.valid or result.weight <= 0.0:
         # Disabled atoms are neutral so a single bad rule cannot veto the tree.
         return 1.0
-    return _clamp(result.truth)
+    truth = _clamp(result.truth)
+    weight = _clamp(result.weight)
+    # Fractional weights are reliability scores: weight 1 keeps the raw truth,
+    # weight 0 makes the leaf neutral.  This lets transductive reliability
+    # calibration downweight an unstable atom without a hard on/off switch.
+    return _clamp(1.0 - weight * (1.0 - truth))
 
 
 def _evaluate(
@@ -111,6 +118,49 @@ def _evaluate(
     return value
 
 
+def _active_failed_atom_ids(
+    node: LogicNode,
+    atom_results: Mapping[str, AtomicResult],
+    fail_threshold: float,
+    epsilon: float,
+) -> List[str]:
+    """Return failed leaves that can actually violate the formula.
+
+    In particular, a false alternative below a satisfied OR is not a rule
+    violation.  Treating every low-valued OR leaf as anomalous used to make
+    mutually exclusive normal variants all paint the logic heat-map.
+    """
+    if node.op == "LEAF":
+        return (
+            [node.atom_id]
+            if _leaf_truth(node.atom_id, atom_results) < fail_threshold
+            else []
+        )
+
+    if node.op == "OR":
+        value = _evaluate(node, atom_results, epsilon=epsilon, trace=[])
+        if value >= fail_threshold:
+            return []
+
+    if node.op == "NOT":
+        # Atomic responsibility maps describe how a positive predicate fails.
+        # They cannot faithfully localise a NOT violation, so do not project
+        # the child as if it were an ordinary failed positive predicate.
+        return []
+
+    active: List[str] = []
+    for child in node.children:
+        active.extend(
+            _active_failed_atom_ids(
+                child,
+                atom_results,
+                fail_threshold=fail_threshold,
+                epsilon=epsilon,
+            )
+        )
+    return list(dict.fromkeys(active))
+
+
 def execute_formula(
     formula: LogicNode,
     atom_results: Mapping[str, AtomicResult],
@@ -119,13 +169,20 @@ def execute_formula(
 ) -> LogicResult:
     trace: List[Dict[str, object]] = []
     root_truth = _evaluate(formula, atom_results, epsilon=epsilon, trace=trace)
+    active_failed_atom_ids = _active_failed_atom_ids(
+        formula,
+        atom_results,
+        fail_threshold=float(fail_threshold),
+        epsilon=epsilon,
+    )
+    active_failed = set(active_failed_atom_ids)
 
     failed = []
     for atom_id in formula.atom_ids():
         result = atom_results.get(atom_id)
         if result is None or not result.valid or result.weight <= 0.0:
             continue
-        if result.truth < fail_threshold:
+        if atom_id in active_failed:
             failed.append(
                 {
                     "id": atom_id,
@@ -158,5 +215,6 @@ def execute_formula(
             atom_id: float(_leaf_truth(atom_id, atom_results))
             for atom_id in formula.atom_ids()
         },
+        active_failed_atom_ids=active_failed_atom_ids,
         node_trace={"nodes": serial_trace},
     )

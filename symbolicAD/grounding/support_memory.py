@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -11,7 +12,7 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 from symbolicAD.config import Config
-from symbolicAD.models.clip_backbone import CLIPBackbone
+from symbolicAD.models.clip_backbone import CLIPBackbone, IMAGE_PREPROCESS_VERSION
 from symbolicAD.models.text_embeddings import encode_prompts_cached
 from symbolicAD.rules.schema import RuleKB
 
@@ -21,8 +22,130 @@ from .component_maps import (
     text_similarity_map,
 )
 from .geometry import containment, fit_gaussian, pair_feature, pair_geometry
-from .instance_extractor import extract_instances
+from .instance_extractor import (
+    component_spatial_prior,
+    extract_instances,
+    image_to_lab_grid,
+    lab_color_similarity,
+    named_color_lab,
+    select_instances,
+)
 from .scene_graph import ComponentInstance
+
+
+SUPPORT_MEMORY_VERSION = "v8_baseline_signature"
+LOGIC_CALIBRATION_VERSION = "v4_loo_failure_rate"
+
+
+def baseline_signature(config: Config) -> str:
+    """Stable hash of the baseline configuration that produced cached stats."""
+    payload = {
+        "baseline": config.model.baseline,
+        "feature_source": config.model.feature_source,
+        "feature_layers": list(config.model.feature_layers),
+        "projected_weight": config.model.projected_weight,
+        "knn": config.model.knn,
+        "spatial_radius": config.model.spatial_radius,
+        "spatial_weight": config.model.spatial_weight,
+        "local_radius": config.model.local_radius,
+        "local_weight": config.model.local_weight,
+        "whiten": config.model.whiten,
+        "whiten_components": config.model.whiten_components,
+        "image_score_percent": config.model.image_score_percent,
+        "image_text_weight": config.model.image_text_weight,
+        "foreground_masking": config.model.foreground_masking,
+        "foreground_soft": config.model.foreground_soft,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def support_image_signature(images: Sequence) -> str:
+    """Stable content hash for the ordered normal support set."""
+    digest = hashlib.sha256()
+    for image in images:
+        array = np.asarray(image.convert("RGB") if hasattr(image, "convert") else image)
+        digest.update(str(array.shape).encode("ascii"))
+        digest.update(np.asarray(array, dtype=np.uint8).tobytes())
+    return digest.hexdigest()
+
+
+def rule_grounding_signature(rule_kb: RuleKB) -> str:
+    """Hash the rule fields that determine visual grounding memory."""
+    payload = {
+        "components": [
+            {
+                "name": item.name,
+                "prompts": item.all_prompts(),
+                "role": item.role,
+                "part_of": item.part_of,
+            }
+            for item in rule_kb.components
+        ],
+        "atoms": [
+            {
+                "id": atom.atom_id,
+                "expression": atom.expression,
+                "weight": atom.weight,
+                "params": atom.params,
+            }
+            for atom in rule_kb.atoms
+        ],
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _text_seed_prototypes(
+    patches: np.ndarray,
+    text_maps: np.ndarray,
+    max_prototypes: int,
+    candidate_masks: Optional[np.ndarray] = None,
+) -> List[np.ndarray]:
+    """Select high-response support patches without thresholding raw cosine.
+
+    Raw CLIP text/patch cosine is commonly around 0.2--0.4, so applying the
+    post-normalisation component threshold (0.55 by default) at this bootstrap
+    stage yields no instances and collapses every concept to global features.
+    """
+    patches = np.asarray(patches, dtype=np.float32)
+    text_maps = np.asarray(text_maps, dtype=np.float32)
+    if patches.ndim != 4 or text_maps.shape != (
+        patches.shape[0],
+        patches.shape[2],
+        patches.shape[3],
+    ):
+        raise ValueError(
+            f"patches {patches.shape} and text maps {text_maps.shape} are incompatible"
+        )
+    if candidate_masks is not None:
+        candidate_masks = np.asarray(candidate_masks)
+        if candidate_masks.shape != text_maps.shape:
+            raise ValueError(
+                f"candidate masks {candidate_masks.shape} and text maps "
+                f"{text_maps.shape} are incompatible"
+            )
+    limit = max(1, int(max_prototypes))
+    per_image = max(1, int(np.ceil(limit / max(patches.shape[0], 1))))
+    candidates: List[tuple[float, np.ndarray]] = []
+    for image_index in range(patches.shape[0]):
+        scores = text_maps[image_index].reshape(-1)
+        if candidate_masks is not None:
+            valid = np.flatnonzero(candidate_masks[image_index].reshape(-1) > 0)
+        else:
+            valid = np.arange(scores.size)
+        if valid.size == 0:
+            valid = np.arange(scores.size)
+        count = min(per_image, valid.size)
+        local = np.argpartition(scores[valid], valid.size - count)[-count:]
+        indices = valid[local]
+        features = patches[image_index].reshape(patches.shape[1], -1)
+        for index in indices:
+            candidates.append((float(scores[index]), features[:, index].copy()))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return [feature for _, feature in candidates[:limit]]
 
 
 @dataclass
@@ -46,6 +169,9 @@ class ComponentMemory:
     slot_masks: np.ndarray = field(
         default_factory=lambda: np.zeros((0, 1, 1), dtype=np.float32)
     )
+    color_prototypes: np.ndarray = field(
+        default_factory=lambda: np.zeros((0, 3), dtype=np.float32)
+    )
 
 
 @dataclass
@@ -67,6 +193,8 @@ class SupportMemory:
     relations: Dict[str, RelationMemory] = field(default_factory=dict)
     baseline_stats: Dict[str, float] = field(default_factory=dict)
     attribute_stats: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    atom_stats: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    logic_stats: Dict[str, float] = field(default_factory=dict)
     feature_dim: int = 0
     metadata: Dict[str, object] = field(default_factory=dict)
 
@@ -135,7 +263,24 @@ def build_support_memory(
     global_features = encoded["global"]
     count, _, height, width = patches.shape
     grid_size = (height, width)
+    color_grids = [image_to_lab_grid(image, grid_size) for image in support_images]
     grounding = config.grounding
+
+    spatial_priors = {
+        symbol.name: np.stack(
+            [
+                component_spatial_prior(
+                    image,
+                    grid_size,
+                    position=rule_kb.position_for(symbol.name),
+                    role=symbol.role,
+                )
+                for image in support_images
+            ],
+            axis=0,
+        ).astype(np.float32)
+        for symbol in rule_kb.components
+    }
 
     text_maps: Dict[str, np.ndarray] = {}
     prototypes: Dict[str, List[np.ndarray]] = {}
@@ -149,21 +294,15 @@ def build_support_memory(
             enabled=grounding.text_embedding_cache,
         )
         text_maps[symbol.name] = maps
-        collected: List[np.ndarray] = []
-        for image_index in range(count):
-            instances = extract_instances(
-                component_map=maps[image_index],
-                patch_features=patches[image_index],
-                concept=symbol.name,
-                threshold=grounding.component_threshold,
-                min_area=grounding.min_instance_area,
-                morphology_kernel=grounding.morphology_kernel,
-            )
-            collected.extend(instance.feature for instance in instances)
+        collected = _text_seed_prototypes(
+            patches,
+            maps,
+            grounding.max_prototypes_per_component,
+            candidate_masks=spatial_priors[symbol.name],
+        )
         if not collected:
             collected = [global_features[index] for index in range(count)]
-        ordered = sorted(collected, key=lambda item: -float(np.linalg.norm(item)))
-        prototypes[symbol.name] = ordered[: grounding.max_prototypes_per_component]
+        prototypes[symbol.name] = collected[: grounding.max_prototypes_per_component]
 
     components: Dict[str, ComponentMemory] = {}
     instances_per_component: Dict[str, List[List[ComponentInstance]]] = {}
@@ -176,13 +315,20 @@ def build_support_memory(
             grounding.alpha * text_maps[name]
             + (1.0 - grounding.alpha) * prototype_similarity_map(patches, proto)
         )
-        q_low = float(np.quantile(fused, grounding.support_quantile_low))
-        q_high = float(np.quantile(fused, grounding.support_quantile_high))
+        prior_values = fused[spatial_priors[name] > 0]
+        if prior_values.size == 0:
+            prior_values = fused.reshape(-1)
+        q_low = float(np.quantile(prior_values, grounding.support_quantile_low))
+        q_high = float(np.quantile(prior_values, grounding.support_quantile_high))
 
         image_instances: List[List[ComponentInstance]] = []
         expected = np.zeros(grid_size, dtype=np.float32)
         for image_index in range(count):
             normalized = normalize_with_support(fused[image_index], q_low, q_high)
+            prior = spatial_priors[name][image_index]
+            normalized *= prior
+            if "container" in symbol.role.lower():
+                normalized = np.maximum(normalized, 0.6 * prior)
             instances = extract_instances(
                 component_map=normalized,
                 patch_features=patches[image_index],
@@ -190,7 +336,9 @@ def build_support_memory(
                 threshold=grounding.component_threshold,
                 min_area=grounding.min_instance_area,
                 morphology_kernel=grounding.morphology_kernel,
+                color_grid=color_grids[image_index],
             )
+            instances = select_instances(instances, rule_kb.count_for(name))
             image_instances.append(instances)
             union = np.zeros(grid_size, dtype=np.float32)
             for instance in instances:
@@ -215,6 +363,12 @@ def build_support_memory(
             exist_q50=float(np.quantile(max_confidences, 0.50)) if max_confidences.size else 1.0,
             expected_mask=expected.astype(np.float32),
             slot_masks=_slot_masks_from_instances(image_instances, grid_size),
+            color_prototypes=np.stack(
+                [item.color_feature for items in image_instances for item in items],
+                axis=0,
+            ).astype(np.float32)
+            if any(image_instances)
+            else np.zeros((0, 3), dtype=np.float32),
         )
         instances_per_component[name] = image_instances
 
@@ -301,20 +455,35 @@ def build_support_memory(
         component = atom.components[0]
         if component not in instances_per_component:
             continue
-        embeddings = encode_prompts_cached(
-            backbone,
-            atom.attribute_prompts,
-            cache_dir=config.text_embedding_dir,
-            enabled=grounding.text_embedding_cache,
-        )
         scores: List[float] = []
-        for image_index in range(count):
-            instances = instances_per_component[component][image_index]
-            if not instances:
-                continue
-            features = np.stack([item.feature for item in instances], axis=0)
-            similarities = features @ embeddings.T
-            scores.append(float(similarities.max()))
+        color_target = (
+            named_color_lab(atom.attribute_value or "")
+            if (atom.attribute or "").lower() in {"color", "colour"}
+            else None
+        )
+        if color_target is not None:
+            for instances in instances_per_component[component]:
+                if instances:
+                    scores.append(
+                        max(
+                            lab_color_similarity(item.color_feature, color_target)
+                            for item in instances
+                        )
+                    )
+        else:
+            embeddings = encode_prompts_cached(
+                backbone,
+                atom.attribute_prompts,
+                cache_dir=config.text_embedding_dir,
+                enabled=grounding.text_embedding_cache,
+            )
+            for image_index in range(count):
+                instances = instances_per_component[component][image_index]
+                if not instances:
+                    continue
+                features = np.stack([item.feature for item in instances], axis=0)
+                similarities = features @ embeddings.T
+                scores.append(float(similarities.max()))
         if scores:
             values = np.asarray(scores, dtype=np.float64)
             attribute_stats[atom.atom_id] = {
@@ -348,6 +517,23 @@ def build_support_memory(
             "seed": int(config.support_seed),
             "alpha": float(grounding.alpha),
             "threshold": float(grounding.component_threshold),
+            "min_instance_area": int(grounding.min_instance_area),
+            "morphology_kernel": int(grounding.morphology_kernel),
+            "support_quantile_low": float(grounding.support_quantile_low),
+            "support_quantile_high": float(grounding.support_quantile_high),
+            "max_prototypes_per_component": int(
+                grounding.max_prototypes_per_component
+            ),
+            "clip_model": str(backbone.model_name),
+            "image_size": int(backbone.image_size),
+            "grid_size": [int(height), int(width)],
+            "feature_dim": int(patches.shape[1]),
+            "preprocess_version": IMAGE_PREPROCESS_VERSION,
+            "support_memory_version": SUPPORT_MEMORY_VERSION,
+            "logic_calibration_version": LOGIC_CALIBRATION_VERSION,
+            "baseline_signature": baseline_signature(config),
+            "support_signature": support_image_signature(support_images),
+            "rule_grounding_signature": rule_grounding_signature(rule_kb),
             "component_names": [symbol.name for symbol in rule_kb.components],
             "attribute_atom_ids": [
                 atom.atom_id
@@ -368,6 +554,8 @@ def save_support_memory(memory: SupportMemory, path: str | Path) -> Path:
         "feature_dim": memory.feature_dim,
         "baseline_stats": memory.baseline_stats,
         "attribute_stats": memory.attribute_stats,
+        "atom_stats": memory.atom_stats,
+        "logic_stats": memory.logic_stats,
         "metadata": memory.metadata,
         "components": [],
         "relations": [],
@@ -378,6 +566,7 @@ def save_support_memory(memory: SupportMemory, path: str | Path) -> Path:
         payload[f"{key}_global"] = component.global_prototype.astype(np.float32)
         payload[f"{key}_expected_mask"] = component.expected_mask.astype(np.float32)
         payload[f"{key}_slot_masks"] = component.slot_masks.astype(np.float32)
+        payload[f"{key}_colors"] = component.color_prototypes.astype(np.float32)
         manifest["components"].append(
             {
                 "key": key,
@@ -432,6 +621,11 @@ def load_support_memory(path: str | Path) -> SupportMemory:
                 exist_q50=float(entry.get("exist_q50", 1.0)),
                 expected_mask=payload[f"{key}_expected_mask"].astype(np.float32),
                 slot_masks=payload[f"{key}_slot_masks"].astype(np.float32),
+                color_prototypes=(
+                    payload[f"{key}_colors"].astype(np.float32)
+                    if f"{key}_colors" in payload
+                    else np.zeros((0, 3), dtype=np.float32)
+                ),
             )
         relations: Dict[str, RelationMemory] = {}
         for entry in manifest["relations"]:
@@ -461,6 +655,8 @@ def load_support_memory(path: str | Path) -> SupportMemory:
             relations=relations,
             baseline_stats=dict(manifest.get("baseline_stats", {})),
             attribute_stats=dict(manifest.get("attribute_stats", {})),
+            atom_stats=dict(manifest.get("atom_stats", {})),
+            logic_stats=dict(manifest.get("logic_stats", {})),
             feature_dim=int(manifest.get("feature_dim", 0)),
             metadata=dict(manifest.get("metadata", {})),
         )

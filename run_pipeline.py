@@ -33,15 +33,33 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shot", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--device", default=None)
+    parser.add_argument("--image-size", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--max-images", type=int, default=None, help="limit per test group")
     parser.add_argument("--cache-dir", default=None)
-    parser.add_argument("--results-dir", default="./1103results")
+    parser.add_argument(
+        "--results-dir",
+        default=None,
+        help="base output directory; each run is placed in a fresh timestamped subdirectory",
+    )
     parser.add_argument("--force-support", action="store_true", help="rebuild support memory")
     parser.add_argument("--force-rules", action="store_true", help="reload rule templates")
     parser.add_argument("--no-visualizations", action="store_true")
     parser.add_argument("--no-maps", action="store_true")
+    parser.add_argument(
+        "--no-reference-images",
+        action="store_true",
+        help="skip per-sample ori/gt/heatmap JPEG triplets",
+    )
     parser.add_argument("--no-pro", action="store_true")
+    parser.add_argument(
+        "--allow-transductive",
+        action="store_true",
+        help=(
+            "allow query-distribution feature selection and atom reliability; "
+            "results are marked transductive and are not strict FSAD"
+        ),
+    )
     return parser
 
 
@@ -62,6 +80,8 @@ def main() -> None:
         config.support_seed = args.seed
     if args.device:
         config.model.device = args.device
+    if args.image_size is not None:
+        config.model.image_size = args.image_size
     if args.batch_size is not None:
         config.model.batch_size = args.batch_size
     if args.max_images is not None:
@@ -74,8 +94,12 @@ def main() -> None:
         config.output.save_visualizations = False
     if args.no_maps:
         config.output.save_maps = False
+    if args.no_reference_images:
+        config.output.save_reference_images = False
     if args.no_pro:
         config.evaluation.enable_pro = False
+    if args.allow_transductive:
+        config.evaluation.allow_transductive = True
 
     if args.all:
         categories = list(LOCO_CLASSES)
@@ -86,7 +110,8 @@ def main() -> None:
 
     print(
         f"[SymbolicAD] dataset={config.dataset} categories={categories} "
-        f"mode={config.mode} shot={config.shot} device={config.model.device}",
+        f"mode={config.mode} shot={config.shot} device={config.model.device} "
+        f"protocol={'transductive' if config.evaluation.allow_transductive else 'strict'}",
         flush=True,
     )
     run_categories(
