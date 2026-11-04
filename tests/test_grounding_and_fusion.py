@@ -147,9 +147,6 @@ def test_logic_heatmap_only_projects_formula_active_failures():
     )
     heatmap, atom_maps = build_logic_heatmap(
         atom_results,
-        rule_kb,
-        np.ones((4, 2, 2), dtype=np.float32),
-        None,
         load_config(),
         logic_result=logic_result,
     )

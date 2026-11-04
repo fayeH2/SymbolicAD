@@ -25,8 +25,6 @@ def main() -> None:
     parser.add_argument("--category", default=None)
     parser.add_argument("--all", action="store_true")
     parser.add_argument("--max-images", type=int, default=None)
-    parser.add_argument("--force-support", action="store_true")
-    parser.add_argument("--force-rules", action="store_true")
     parser.add_argument("--no-visualizations", action="store_true")
     args = parser.parse_args()
 
@@ -37,12 +35,7 @@ def main() -> None:
     if args.no_visualizations:
         config.output.save_visualizations = False
     categories = list(LOCO_CLASSES) if args.all or not args.category else [args.category]
-    run_categories(
-        config,
-        categories,
-        force_support=args.force_support,
-        force_rules=args.force_rules,
-    )
+    run_categories(config, categories)
 
 
 if __name__ == "__main__":

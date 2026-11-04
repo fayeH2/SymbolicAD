@@ -13,13 +13,11 @@ from scipy.optimize import linear_sum_assignment
 
 from symbolicAD.config import Config
 from symbolicAD.models.clip_backbone import CLIPBackbone, IMAGE_PREPROCESS_VERSION
-from symbolicAD.models.text_embeddings import encode_prompts_cached
 from symbolicAD.rules.schema import RuleKB
 
 from .component_maps import (
     normalize_with_support,
     prototype_similarity_map,
-    text_similarity_map,
 )
 from .geometry import containment, fit_gaussian, pair_feature, pair_geometry
 from .instance_extractor import (
@@ -33,7 +31,7 @@ from .instance_extractor import (
 from .scene_graph import ComponentInstance
 
 
-SUPPORT_MEMORY_VERSION = "v8_baseline_signature"
+SUPPORT_MEMORY_VERSION = "v10_static_attribute_prototypes"
 LOGIC_CALIBRATION_VERSION = "v4_loo_failure_rate"
 
 
@@ -52,7 +50,6 @@ def baseline_signature(config: Config) -> str:
         "whiten": config.model.whiten,
         "whiten_components": config.model.whiten_components,
         "image_score_percent": config.model.image_score_percent,
-        "image_text_weight": config.model.image_text_weight,
         "foreground_masking": config.model.foreground_masking,
         "foreground_soft": config.model.foreground_soft,
     }
@@ -193,6 +190,7 @@ class SupportMemory:
     relations: Dict[str, RelationMemory] = field(default_factory=dict)
     baseline_stats: Dict[str, float] = field(default_factory=dict)
     attribute_stats: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    attribute_prototypes: Dict[str, np.ndarray] = field(default_factory=dict)
     atom_stats: Dict[str, Dict[str, float]] = field(default_factory=dict)
     logic_stats: Dict[str, float] = field(default_factory=dict)
     feature_dim: int = 0
@@ -256,6 +254,11 @@ def build_support_memory(
     config: Config,
     baseline=None,
 ) -> SupportMemory:
+    # Offline compiler dependency: deployment only calls load_support_memory
+    # and therefore never imports or evaluates CLIP text seeding.
+    from .offline_text_seeding import text_similarity_map
+    from symbolicAD.models.text_embeddings import encode_prompts_cached
+
     if not support_images:
         raise ValueError("support set is empty")
     encoded = backbone.encode_images(support_images)
@@ -311,10 +314,10 @@ def build_support_memory(
         proto = np.stack(prototypes[name], axis=0).astype(np.float32)
         proto_norms = np.linalg.norm(proto, axis=1, keepdims=True)
         proto = proto / np.maximum(proto_norms, 1e-8)
-        fused = (
-            grounding.alpha * text_maps[name]
-            + (1.0 - grounding.alpha) * prototype_similarity_map(patches, proto)
-        )
+        # Text prompts only seed which normal support patches become visual
+        # prototypes. Support calibration and runtime both use frozen visual
+        # prototype similarity.
+        fused = prototype_similarity_map(patches, proto)
         prior_values = fused[spatial_priors[name] > 0]
         if prior_values.size == 0:
             prior_values = fused.reshape(-1)
@@ -449,6 +452,7 @@ def build_support_memory(
                 )
 
     attribute_stats: Dict[str, Dict[str, float]] = {}
+    attribute_prototypes: Dict[str, np.ndarray] = {}
     for atom in rule_kb.atoms:
         if atom.kind != "AttributeMatch" or not atom.components:
             continue
@@ -477,6 +481,7 @@ def build_support_memory(
                 cache_dir=config.text_embedding_dir,
                 enabled=grounding.text_embedding_cache,
             )
+            selected_features: List[np.ndarray] = []
             for image_index in range(count):
                 instances = instances_per_component[component][image_index]
                 if not instances:
@@ -484,6 +489,12 @@ def build_support_memory(
                 features = np.stack([item.feature for item in instances], axis=0)
                 similarities = features @ embeddings.T
                 scores.append(float(similarities.max()))
+                best = int(np.unravel_index(np.argmax(similarities), similarities.shape)[0])
+                selected_features.append(features[best])
+            if selected_features:
+                prototype = np.mean(np.stack(selected_features, axis=0), axis=0)
+                prototype /= max(float(np.linalg.norm(prototype)), 1e-8)
+                attribute_prototypes[atom.atom_id] = prototype.astype(np.float32)
         if scores:
             values = np.asarray(scores, dtype=np.float64)
             attribute_stats[atom.atom_id] = {
@@ -510,12 +521,12 @@ def build_support_memory(
         relations=relations,
         baseline_stats=baseline_stats,
         attribute_stats=attribute_stats,
+        attribute_prototypes=attribute_prototypes,
         feature_dim=int(patches.shape[1]),
         metadata={
             "support_count": int(count),
             "shot": int(config.shot),
             "seed": int(config.support_seed),
-            "alpha": float(grounding.alpha),
             "threshold": float(grounding.component_threshold),
             "min_instance_area": int(grounding.min_instance_area),
             "morphology_kernel": int(grounding.morphology_kernel),
@@ -554,6 +565,7 @@ def save_support_memory(memory: SupportMemory, path: str | Path) -> Path:
         "feature_dim": memory.feature_dim,
         "baseline_stats": memory.baseline_stats,
         "attribute_stats": memory.attribute_stats,
+        "attribute_prototypes": [],
         "atom_stats": memory.atom_stats,
         "logic_stats": memory.logic_stats,
         "metadata": memory.metadata,
@@ -595,6 +607,10 @@ def save_support_memory(memory: SupportMemory, path: str | Path) -> Path:
                 "has_pair_prototype": relation.pair_prototype is not None,
             }
         )
+    for index, (atom_id, prototype) in enumerate(memory.attribute_prototypes.items()):
+        key = f"a{index}"
+        payload[f"{key}_prototype"] = np.asarray(prototype, dtype=np.float32)
+        manifest["attribute_prototypes"].append({"key": key, "atom_id": atom_id})
     payload["manifest"] = np.asarray(
         json.dumps(manifest, ensure_ascii=False, sort_keys=True)
     )
@@ -648,6 +664,10 @@ def load_support_memory(path: str | Path) -> SupportMemory:
                 pair_prototype=pair,
                 sample_count=int(entry["sample_count"]),
             )
+        attribute_prototypes = {
+            entry["atom_id"]: payload[f"{entry['key']}_prototype"].astype(np.float32)
+            for entry in manifest.get("attribute_prototypes", [])
+        }
         return SupportMemory(
             category=manifest["category"],
             grid_size=tuple(int(value) for value in manifest["grid_size"]),
@@ -655,6 +675,7 @@ def load_support_memory(path: str | Path) -> SupportMemory:
             relations=relations,
             baseline_stats=dict(manifest.get("baseline_stats", {})),
             attribute_stats=dict(manifest.get("attribute_stats", {})),
+            attribute_prototypes=attribute_prototypes,
             atom_stats=dict(manifest.get("atom_stats", {})),
             logic_stats=dict(manifest.get("logic_stats", {})),
             feature_dim=int(manifest.get("feature_dim", 0)),

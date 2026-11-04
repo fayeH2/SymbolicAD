@@ -51,8 +51,8 @@ from symbolicAD.grounding.component_maps import (
     build_component_maps,
     normalize_with_support,
     prototype_similarity_map,
-    text_similarity_map,
 )
+from symbolicAD.grounding.offline_text_seeding import text_similarity_map
 from symbolicAD.grounding.instance_extractor import (
     component_spatial_prior,
     extract_instances,
@@ -75,11 +75,8 @@ from symbolicAD.models.clip_backbone import CLIPBackbone
 from symbolicAD.models.text_embeddings import encode_prompts_cached
 from symbolicAD.rules.compiler import compile_rule_kb
 from symbolicAD.rules.executor import execute_formula
-from symbolicAD.rules.qwen_rule_generator import (
-    DEFAULT_TEMPLATE_DIR,
-    load_or_generate_rules,
-)
 from symbolicAD.rules.schema import RuleKB
+from symbolicAD.static_program import StaticProgramPaths, load_rule_program
 from symbolicAD.rules.validator import validate_against_support, validate_rule_kb
 from symbolicAD.visualization.render_results import save_reference_triplet
 from symbolicAD.visualization.result_layout import (
@@ -230,7 +227,6 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--vis-per-group", type=int, default=3)
     parser.add_argument("--enable-pro", action="store_true")
-    parser.add_argument("--force-rules", action="store_true")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -243,10 +239,12 @@ def main() -> None:
         config.model.device = args.device
     if args.batch_size is not None:
         config.model.batch_size = args.batch_size
+    if args.cache_dir:
+        config.paths.cache_dir = args.cache_dir
+    static_paths = StaticProgramPaths.for_category(config, category)
 
     layout = RunLayout.create(Path(args.output_dir), config)
     output_dir = layout.root
-    config.paths.cache_dir = args.cache_dir or str(output_dir / "cache")
     config.paths.results_dir = str(output_dir)
     for name in ["rules", "support", "clip_alignment", "grounding", "logic", "metrics", "plots", "visualizations"]:
         (output_dir / name).mkdir(parents=True, exist_ok=True)
@@ -264,16 +262,9 @@ def main() -> None:
     )
 
     # --------------------------------------------------------------- rule banks
-    # Qwen3-VL inspects the support images and emits a structured description.
-    # The deterministic builder converts it into atoms; nothing category-specific
-    # is hand-written here.
-    rule_kb = load_or_generate_rules(
-        category,
-        config.rule_cache_dir,
-        force=args.force_rules,
-        support_images=support_images,
-        config=config,
-    )
+    # Diagnostics consume the exact frozen program used by inference. They do
+    # not load Qwen, regenerate rules or mutate the deployment expression tree.
+    rule_kb = load_rule_program(static_paths)
     qwen_raw_path = (
         config.cache_dir
         / config.qwen.cache_subdir
@@ -518,13 +509,9 @@ def main() -> None:
         patches = encoded["patches"]
         base_maps, raw_scores = _baseline_maps(baseline, patches, support_memory.baseline_stats)
         component_maps = build_component_maps(
-            backbone,
             patches,
             rule_kb,
-            support_memory=support_memory,
-            alpha=config.grounding.alpha,
-            cache_dir=config.text_embedding_dir,
-            text_cache_enabled=config.grounding.text_embedding_cache,
+            support_memory,
         )
 
         for offset, sample in enumerate(batch):
@@ -541,9 +528,7 @@ def main() -> None:
                 config,
                 image=image,
             )
-            atom_results = evaluate_atoms(
-                scene_graph, rule_kb, support_memory, config, backbone=backbone
-            )
+            atom_results = evaluate_atoms(scene_graph, rule_kb, support_memory, config)
             logic_result = execute_formula(
                 rule_kb.formula,
                 atom_results,
@@ -552,9 +537,6 @@ def main() -> None:
             )
             logic_map, _ = build_logic_heatmap(
                 atom_results,
-                rule_kb,
-                image_patches,
-                backbone,
                 config,
                 logic_result=logic_result,
             )
@@ -666,10 +648,7 @@ def main() -> None:
                 proto_map = prototype_similarity_map(
                     image_patches[None, ...], memory.prototypes
                 )[0]
-                fused = (
-                    config.grounding.alpha * text_map
-                    + (1.0 - config.grounding.alpha) * proto_map
-                )
+                fused = proto_map
                 expected = memory.expected_mask
                 query_alignment[name]["corr"].append(pearson(text_map, proto_map))
                 query_alignment[name]["text_contrast"].append(contrast(text_map, expected))

@@ -15,14 +15,14 @@ The small juice-bottle image gain came from a 0.02 image-score residual, not
 from improved logical localisation.  Three-sample smoke runs with AUROC 1.0
 must not be compared with full-category results.
 
-## Bugs and protocol risks fixed in the baseline commit
+## Bugs and protocol risks removed
 
-1. `model.feature_source=auto` selected native/projected/ensemble CLIP features
-   from the test-query score distribution.  It is now fixed to `both` in strict
-   FSAD; auto selection requires the explicit `--allow-transductive` flag.
+1. `model.feature_source=auto` and its test-query Otsu selector were deleted.
+   The CLIP feature source is fixed before static-program compilation.
 2. Query-side atom reliability disabled a rule when it was violated by most
    test queries.  That can erase the desired anomaly signal.  Strict evaluation
-   now performs rule calibration only on the two normal support images.
+   The complete query-frequency path was deleted; rule reliability is frozen
+   from the two normal support images.
 3. Every metrics file now records the protocol, query adaptation, sample limit,
    effective fusion weights, whether logic abstained, and baseline-to-final
    AUROC deltas.
@@ -30,16 +30,17 @@ must not be compared with full-category results.
    treated as executable evidence.
 5. Every run uses a fresh microsecond timestamped output directory.
 
-The old transductive behaviour remains available only for a separately named
-ablation.  It must not be mixed into the strict 2-shot headline table.
+There is no transductive mode in the deployment pipeline.
 
 ## Segment-first SymbolicDet implementation
 
 The V5 supplement follows this frozen support-to-query flow:
 
 ```text
-2 normal supports
-  -> foreground segmentation + support colour prototypes
+OFFLINE (Qwen allowed only in generate_rules.py)
+2 normal supports -> Qwen semantic proposal
+2 normal supports -> CLIP patch extraction
+  -> CLIP visual prototypes and component masks
   -> masks and attributes (area/count/centroid/occupancy/Lab/edge)
   -> pair relations (dx/dy/distance)
   -> support-fitted dynamic interval expressions
@@ -47,9 +48,12 @@ The V5 supplement follows this frozen support-to-query flow:
   -> per-image sparse MoE routing
   -> localised symbolic map
 
-query -> fixed CLIP map ---------------------------\
-query -> fixed Qwen component rules ----------------+-> separate gated fusion
-query -> fixed SegmentFirst SymbolicDet model ------/
+  -> compiled immutable static program
+
+INFERENCE (no LLM imports/calls)
+query -> CLIP patch features -> static semantic expression tree --\
+                           -> static SymbolicDet expressions -------+-> fusion
+                           -> visual-memory anomaly predicate ------/
 ```
 
 The dynamic expressions use min/max support envelopes plus feature-specific
@@ -59,14 +63,17 @@ place where it should have appeared.  Relation violations paint both involved
 components.  The sparse router chooses the strongest experts within a single
 query, but never uses other query images, query labels, or test-set metrics.
 
-The fitted colour prototypes, expert priors and human-readable expressions are
-saved as `checkpoint/<category>_symbolicdet.json` in each timestamped run.
+Segmentation identities come from CLIP patch prototypes; Lab colour is an
+explicit attribute calculated on those masks. The visual prototypes, expected
+masks, expert priors and expressions are frozen under
+`cache/static_programs/<category>_k<shot>/`. Inference fails if that package is
+missing or incompatible and never rebuilds it.
 
 ## Required experiment matrix
 
 Run every row with the same support seed and full test set (`max_images=0`):
 
-| row | CLIP | Qwen rules | SegmentFirst | purpose |
+| row | CLIP visual memory | compiled semantic rules | SegmentFirst | purpose |
 |---|---:|---:|---:|---|
 | B0 | yes | no | no | strict baseline |
 | B1 | yes | yes | no | old symbolic contribution |
@@ -81,7 +88,7 @@ python run_pipeline.py --mode baseline --all --shot 2
 # B1
 python run_pipeline.py --mode baseline_logic --all --shot 2 --no-symbolicdet
 # B2
-python run_pipeline.py --mode baseline_logic --all --shot 2 --no-qwen-logic
+python run_pipeline.py --mode baseline_logic --all --shot 2 --no-semantic-rules
 # V5
 python run_pipeline.py --mode baseline_logic --all --shot 2
 ```

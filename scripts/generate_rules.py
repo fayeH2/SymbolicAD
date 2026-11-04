@@ -1,8 +1,8 @@
 #!/usr/bin/env python
-"""Materialise tracked rule templates into ``cache/rules``.
+"""Offline-only Qwen rule proposal generation into ``cache/rules``.
 
-Stage 4 will replace the template source with Qwen3-VL output.  The cache and
-validation path stays identical.
+This is the only deployment workflow command allowed to load Qwen. The output
+must subsequently be frozen by ``compile_static_program.py``.
 """
 
 

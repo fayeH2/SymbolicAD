@@ -553,7 +553,7 @@ class QwenVLBackend:
         self.model_path = str(model_path)
         self.processor = AutoProcessor.from_pretrained(self.model_path)
         # ``device_map`` is an Accelerate feature and made the otherwise local
-        # Qwen path fail in lean inference environments where Accelerate is not
+        # Qwen path fail in lean offline-generation environments where Accelerate is not
         # installed.  A single 8B model fits on the configured 24 GB device, so
         # construct it normally and move it explicitly instead of introducing
         # an undeclared runtime dependency.

@@ -8,30 +8,14 @@ import numpy as np
 from scipy.ndimage import gaussian_filter
 
 from symbolicAD.config import Config
-from symbolicAD.models.clip_backbone import CLIPBackbone
 from symbolicAD.rules.executor import AtomicResult, LogicResult
-from symbolicAD.rules.schema import RuleKB
-
-from .semantic_rescore import rescore_responsibility
-
 
 def build_atom_heatmap(
     atom_result: AtomicResult,
-    rule_kb: RuleKB,
-    patch_features: np.ndarray,
-    backbone: Optional[CLIPBackbone],
-    config: Config,
 ) -> np.ndarray:
     if not atom_result.valid or atom_result.weight <= 0:
         return np.zeros_like(atom_result.responsibility_map, dtype=np.float32)
-    if config.logic.rescore_enabled:
-        responsibility = rescore_responsibility(
-            atom_result, rule_kb, patch_features, backbone, config
-        )
-    else:
-        responsibility = np.asarray(
-            atom_result.responsibility_map, dtype=np.float32
-        )
+    responsibility = np.asarray(atom_result.responsibility_map, dtype=np.float32)
     return (
         float(atom_result.weight) * (1.0 - float(atom_result.truth)) * responsibility
     ).astype(np.float32)
@@ -39,9 +23,6 @@ def build_atom_heatmap(
 
 def build_logic_heatmap(
     atom_results: Dict[str, AtomicResult],
-    rule_kb: RuleKB,
-    patch_features: np.ndarray,
-    backbone: Optional[CLIPBackbone],
     config: Config,
     logic_result: Optional[LogicResult] = None,
 ) -> tuple[np.ndarray, Dict[str, np.ndarray]]:
@@ -51,8 +32,7 @@ def build_logic_heatmap(
         (result.responsibility_map.shape for result in atom_results.values()), None
     )
     if grid_size is None:
-        height, width = patch_features.shape[1:]
-        grid_size = (height, width)
+        raise ValueError("cannot build logic heatmap without atom results")
     logic_map = np.zeros(grid_size, dtype=np.float32)
 
     active_failed = None
@@ -65,9 +45,7 @@ def build_logic_heatmap(
                 atom_result.responsibility_map, dtype=np.float32
             )
         else:
-            heatmap = build_atom_heatmap(
-                atom_result, rule_kb, patch_features, backbone, config
-            )
+            heatmap = build_atom_heatmap(atom_result)
         atom_heatmaps[atom_id] = heatmap
         logic_map = 1.0 - (1.0 - logic_map) * (1.0 - heatmap)
 

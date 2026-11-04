@@ -1,48 +1,14 @@
-"""Uniform baseline interface plus a CLIP zero-shot baseline.
-
-Stage one wraps a CLIP zero-shot branch so the full pipeline can run without a
-trained checkpoint.  The adapter can later be swapped for WinCLIP, AnomalyCLIP
-or INP-Former without touching the rest of the pipeline.
-"""
+"""Visual CLIP feature-memory baselines for few-shot anomaly detection."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy.ndimage import uniform_filter
 
 from .clip_backbone import CLIPBackbone
-from .text_embeddings import encode_prompts_cached
-
-
-def category_phrase(category: str) -> str:
-    return category.replace("_", " ")
-
-
-def default_prompts(category: str) -> tuple[List[str], List[str]]:
-    phrase = category_phrase(category)
-    normal = [
-        f"a photo of a normal {phrase}",
-        f"a photo of a clean {phrase} without defects",
-        f"a perfect {phrase}",
-        f"a {phrase} in good condition",
-        "a photo of a normal object",
-    ]
-    anomaly = [
-        f"a photo of a damaged {phrase}",
-        f"a photo of a defective {phrase}",
-        f"a {phrase} with a scratch",
-        f"a {phrase} with a dent",
-        f"a {phrase} with contamination",
-        f"a broken {phrase}",
-        f"a {phrase} with missing parts",
-        f"an anomalous {phrase}",
-        "a photo of a damaged object",
-        "a photo of a defective object",
-    ]
-    return normal, anomaly
 
 
 @dataclass
@@ -61,89 +27,6 @@ def topk_mean(maps: np.ndarray, percent: float = 1.0) -> np.ndarray:
     count = min(count, flat.shape[1])
     partitioned = np.partition(flat, flat.shape[1] - count, axis=1)
     return partitioned[:, -count:].mean(axis=1).astype(np.float32)
-
-
-class CLIPZeroShotBaseline:
-    def __init__(
-        self,
-        backbone: CLIPBackbone,
-        category: str,
-        cache_dir: Optional[str] = None,
-        normal_prompts: Optional[Sequence[str]] = None,
-        anomaly_prompts: Optional[Sequence[str]] = None,
-        topk_percent: float = 1.0,
-    ):
-        self.backbone = backbone
-        self.category = category
-        self.topk_percent = float(topk_percent)
-        normal, anomaly = default_prompts(category)
-        self.normal_prompts = list(normal_prompts) if normal_prompts else normal
-        self.anomaly_prompts = list(anomaly_prompts) if anomaly_prompts else anomaly
-        self.normal_embeddings = encode_prompts_cached(
-            backbone, self.normal_prompts, cache_dir
-        )
-        self.anomaly_embeddings = encode_prompts_cached(
-            backbone, self.anomaly_prompts, cache_dir
-        )
-
-    def score_from_features(
-        self,
-        patch_features: np.ndarray,
-    ) -> Dict[str, np.ndarray]:
-        """Compute anomaly maps from pre-computed normalised patch features."""
-        patches = np.asarray(patch_features, dtype=np.float32)
-        # [B, D, h, w] x [N, D] -> [B, N, h, w]
-        sim_normal = np.einsum("bdhw,nd->bnhw", patches, self.normal_embeddings)
-        sim_anomaly = np.einsum("bdhw,md->bmhw", patches, self.anomaly_embeddings)
-        sim_normal = sim_normal.max(axis=1)
-        sim_anomaly = sim_anomaly.max(axis=1)
-        scale = self.backbone.logit_scale
-        logits = np.stack(
-            [sim_normal * scale, sim_anomaly * scale], axis=1
-        ).astype(np.float64)
-        logits -= logits.max(axis=1, keepdims=True)
-        probabilities = np.exp(logits)
-        probabilities /= probabilities.sum(axis=1, keepdims=True)
-        anomaly_map = probabilities[:, 1].astype(np.float32)
-        image_score = topk_mean(anomaly_map, self.topk_percent)
-        return {
-            "anomaly_map": anomaly_map,
-            "image_score": image_score,
-            "normal_similarity": sim_normal.astype(np.float32),
-            "anomaly_similarity": sim_anomaly.astype(np.float32),
-        }
-
-    def forward(self, images: Sequence) -> BaselineOutput:
-        encoded = self.backbone.encode_images(images)
-        scored = self.score_from_features(encoded["patches"])
-        return BaselineOutput(
-            anomaly_map=scored["anomaly_map"],
-            image_score=scored["image_score"],
-            patch_features=encoded["patches"],
-            global_features=encoded["global"],
-            prompt_similarity={
-                "normal": scored["normal_similarity"],
-                "anomaly": scored["anomaly_similarity"],
-            },
-        )
-
-    def support_statistics(
-        self,
-        support_images: Sequence,
-        low_quantile: float = 0.5,
-        high_quantile: float = 0.99,
-    ) -> Dict[str, float]:
-        output = self.forward(support_images)
-        flat = output.anomaly_map.reshape(-1)
-        image_scores = np.asarray(output.image_score, dtype=np.float32)
-        return {
-            "q_low": float(np.quantile(flat, low_quantile)),
-            "q_high": float(np.quantile(flat, high_quantile)),
-            "mean": float(flat.mean()),
-            "std": float(flat.std()),
-            "image_q_low": float(np.quantile(image_scores, low_quantile)),
-            "image_q_high": float(np.quantile(image_scores, high_quantile)),
-        }
 
 
 class CLIPFewShotBaseline:
@@ -392,7 +275,7 @@ def _normalise_rows(features: np.ndarray, axis: int = -1) -> np.ndarray:
 
 
 class CLIPAdaptiveFewShotBaseline:
-    """PromptAD/AnomalyCLIP-style few-shot baseline.
+    """Pure visual CLIP-feature few-shot baseline.
 
     Three deliberate differences from the initial 1-NN baseline:
 
@@ -400,9 +283,7 @@ class CLIPAdaptiveFewShotBaseline:
       projected layer (middle layers preserve local structure);
     * every layer is whitened on the normal support bank before cosine
       matching, which removes CLIP's dominant common directions;
-    * a support-calibrated normal-vs-damaged textual branch is fused
-      harmonically with the visual memory branch, and a generic foreground
-      prior suppresses background responses.
+    * a generic foreground prior suppresses background responses.
 
     Everything is estimated from the normal support images only; there are no
     category-specific constants or query labels.
@@ -412,10 +293,6 @@ class CLIPAdaptiveFewShotBaseline:
         self,
         backbone: CLIPBackbone,
         support_images: Sequence,
-        category: str,
-        cache_dir: Optional[str] = None,
-        normal_prompts: Optional[Sequence[str]] = None,
-        anomaly_prompts: Optional[Sequence[str]] = None,
         topk_percent: float = 1.0,
         knn: int = 5,
         max_bank_size: int = 0,
@@ -426,12 +303,8 @@ class CLIPAdaptiveFewShotBaseline:
         whiten: bool = True,
         whiten_components: int = 128,
         whiten_eps: float = 1e-3,
-        text_visual_weight: float = 0.5,
-        text_visual_fusion: str = "harmonic",
         foreground_masking: bool = True,
         foreground_soft: float = 0.35,
-        image_global_weight: float = 0.0,
-        image_text_weight: float = 0.2,
         feature_source: str = "both",
         normalise_layers: bool = False,
         projected_weight: float = 0.25,
@@ -439,7 +312,6 @@ class CLIPAdaptiveFewShotBaseline:
         if not support_images:
             raise ValueError("few-shot baseline requires at least one support image")
         self.backbone = backbone
-        self.category = category
         self.topk_percent = float(topk_percent)
         self.knn = max(1, int(knn))
         self.max_bank_size = int(max_bank_size)
@@ -450,27 +322,12 @@ class CLIPAdaptiveFewShotBaseline:
         self.whiten = bool(whiten)
         self.whiten_components = int(whiten_components)
         self.whiten_eps = float(whiten_eps)
-        self.text_visual_weight = float(np.clip(text_visual_weight, 0.0, 1.0))
-        self.text_visual_fusion = str(text_visual_fusion).lower()
         self.foreground_masking = bool(foreground_masking)
         self.foreground_soft = float(np.clip(foreground_soft, 0.0, 1.0))
-        self.image_global_weight = float(np.clip(image_global_weight, 0.0, 1.0))
-        self.image_text_weight = float(np.clip(image_text_weight, 0.0, 1.0))
         self.feature_source = str(feature_source).lower()
         self.normalise_layers = bool(normalise_layers)
         self.projected_weight = float(np.clip(projected_weight, 0.0, 1.0))
         self._stats_cache: Dict[tuple, Dict[str, float]] = {}
-
-        normal, anomaly = default_prompts(category)
-        self.normal_prompts = list(normal_prompts) if normal_prompts else normal
-        self.anomaly_prompts = list(anomaly_prompts) if anomaly_prompts else anomaly
-        self.normal_embeddings = encode_prompts_cached(
-            backbone, self.normal_prompts, cache_dir
-        )
-        self.anomaly_embeddings = encode_prompts_cached(
-            backbone, self.anomaly_prompts, cache_dir
-        )
-        self.text_scale = float(backbone.logit_scale)
 
         encoded = backbone.encode_images(support_images)
         self.support_patches = np.asarray(encoded["patches"], dtype=np.float32)
@@ -478,9 +335,7 @@ class CLIPAdaptiveFewShotBaseline:
             int(self.support_patches.shape[2]),
             int(self.support_patches.shape[3]),
         )
-        self.support_global = np.asarray(encoded["global"], dtype=np.float32)
         self.support_foreground = self._support_foreground(support_images)
-        self.support_text_maps = self._text_maps(self.support_patches)
         native_layers = list(encoded.get("patch_layers", []))
         if self.feature_source == "projected":
             layer_features = [self.support_patches]
@@ -669,31 +524,7 @@ class CLIPAdaptiveFewShotBaseline:
             + self.spatial_weight * spatial
         ).astype(np.float32)
 
-    def _text_maps(self, patches: np.ndarray) -> np.ndarray:
-        if self.normal_embeddings.size == 0 or self.anomaly_embeddings.size == 0:
-            batch, _, height, width = patches.shape
-            return np.zeros((batch, height, width), dtype=np.float32)
-        sim_normal = np.einsum(
-            "bdhw,nd->bnhw", patches, self.normal_embeddings
-        ).max(axis=1)
-        sim_anomaly = np.einsum(
-            "bdhw,md->bmhw", patches, self.anomaly_embeddings
-        ).max(axis=1)
-        logits = np.stack(
-            [sim_normal * self.text_scale, sim_anomaly * self.text_scale], axis=1
-        ).astype(np.float64)
-        logits -= logits.max(axis=1, keepdims=True)
-        probabilities = np.exp(logits)
-        probabilities /= probabilities.sum(axis=1, keepdims=True)
-        return probabilities[:, 1].astype(np.float32)
-
     def _calibrate_from_support(self) -> None:
-        text = self.support_text_maps
-        text_values = text[..., :]
-        text_low = float(np.quantile(text_values, 0.50))
-        text_high = float(np.quantile(text_values, 0.99))
-        self.text_stats = {"q_low": text_low, "q_high": text_high}
-
         loo_maps = np.zeros(
             (self.support_patches.shape[0],) + self.grid_size, dtype=np.float32
         )
@@ -741,10 +572,7 @@ class CLIPAdaptiveFewShotBaseline:
             "q_low": float(np.quantile(loo_maps, 0.50)),
             "q_high": float(np.quantile(loo_maps, 0.99)),
         }
-        text_normalised = np.clip(
-            (text - text_low) / max(text_high - text_low, 1e-6), 0.0, 1.0
-        )
-        fused = self._fuse_maps(loo_maps, text_normalised)
+        fused = loo_maps
         fused *= self.support_foreground[None, ...]
         self.fused_stats = {
             "q_low": float(np.quantile(fused, 0.50)),
@@ -764,42 +592,11 @@ class CLIPAdaptiveFewShotBaseline:
             "loo_map_mean": float(unmasked_loo.mean()),
             "loo_map_q99": float(np.quantile(unmasked_loo, 0.99)),
         }
-        # Include the global textual score in the support image calibration.
-        image_scores = topk_mean(fused, self.topk_percent)
-        global_scores = self._global_text_scores(self.support_global)
-        combined = (
-            (1.0 - self.image_global_weight) * image_scores
-            + self.image_global_weight * global_scores
-        )
+        combined = topk_mean(fused, self.topk_percent)
         self.image_stats = {
             "q_low": float(np.quantile(combined, 0.50)),
             "q_high": float(np.quantile(combined, 0.99)),
         }
-
-    def _global_text_scores(self, global_features: np.ndarray) -> np.ndarray:
-        if global_features.size == 0:
-            return np.zeros((0,), dtype=np.float32)
-        sim_normal = global_features @ self.normal_embeddings.T
-        sim_anomaly = global_features @ self.anomaly_embeddings.T
-        normal = sim_normal.max(axis=1) * self.text_scale
-        anomaly = sim_anomaly.max(axis=1) * self.text_scale
-        logits = np.stack([normal, anomaly], axis=1).astype(np.float64)
-        logits -= logits.max(axis=1, keepdims=True)
-        probabilities = np.exp(logits)
-        probabilities /= probabilities.sum(axis=1, keepdims=True)
-        return probabilities[:, 1].astype(np.float32)
-
-    def _fuse_maps(
-        self, visual: np.ndarray, text: np.ndarray
-    ) -> np.ndarray:
-        visual = np.clip(np.asarray(visual, dtype=np.float32), 0.0, 1.0)
-        text = np.clip(np.asarray(text, dtype=np.float32), 0.0, 1.0)
-        weight = self.text_visual_weight
-        if self.text_visual_fusion == "arithmetic":
-            return ((1.0 - weight) * visual + weight * text).astype(np.float32)
-        epsilon = 1e-6
-        denominator = (1.0 - weight) / (visual + epsilon) + weight / (text + epsilon)
-        return (1.0 / np.maximum(denominator, epsilon)).astype(np.float32)
 
     def score_encoded(self, encoded: Dict[str, np.ndarray], images=None) -> Dict[str, np.ndarray]:
         native_layers = encoded.get("patch_layers", [])
@@ -822,35 +619,17 @@ class CLIPAdaptiveFewShotBaseline:
                 raw = np.clip((raw - low) / max(high - low, 1e-6), 0.0, 1.0)
             visual += raw * float(self.layer_weights[layer_index])
 
-        raw_text = self._text_maps(encoded["patches"])
-        text = np.clip(
-            (raw_text - self.text_stats["q_low"])
-            / max(self.text_stats["q_high"] - self.text_stats["q_low"], 1e-6),
-            0.0,
-            1.0,
-        )
-        if self.text_visual_weight > 0.0:
-            fused = self._fuse_maps(visual, text)
-        else:
-            fused = visual
+        fused = visual
         if images is not None and self.foreground_masking:
             priors = np.stack(
                 [self._prior(image, self.grid_size) for image in images], axis=0
             )
             fused = fused * priors
-        map_score = topk_mean(fused, self.topk_percent)
-        text_score = topk_mean(text, self.topk_percent)
-        global_scores = self._global_text_scores(encoded["global"])
-        image_scores = (
-            (1.0 - self.image_text_weight - self.image_global_weight) * map_score
-            + self.image_text_weight * text_score
-            + self.image_global_weight * global_scores
-        )
+        image_scores = topk_mean(fused, self.topk_percent)
         return {
             "anomaly_map": fused.astype(np.float32),
             "image_score": image_scores.astype(np.float32),
             "visual_map": visual.astype(np.float32),
-            "text_map": text.astype(np.float32),
         }
 
     def score_from_features(self, patch_features: np.ndarray) -> Dict[str, np.ndarray]:
@@ -896,15 +675,14 @@ def build_baseline(backbone: CLIPBackbone, support_images: Sequence, category: s
         raise TypeError("config must be a symbolicAD.config.Config")
     if config.model.baseline == "clip_adaptive":
         feature_source = str(config.model.feature_source).lower()
-        if feature_source == "auto":
-            # Callers that have query images resolve "auto" explicitly; without
-            # query images the safe ensemble is the documented fallback.
-            feature_source = "both"
+        if feature_source not in {"native", "projected", "both"}:
+            raise ValueError(
+                "model.feature_source must be fixed to native/projected/both "
+                "before static-program compilation"
+            )
         return CLIPAdaptiveFewShotBaseline(
             backbone,
             support_images,
-            category=category,
-            cache_dir=config.text_embedding_dir,
             topk_percent=config.model.image_score_percent,
             knn=config.model.knn,
             max_bank_size=config.model.max_bank_size,
@@ -915,12 +693,8 @@ def build_baseline(backbone: CLIPBackbone, support_images: Sequence, category: s
             whiten=config.model.whiten,
             whiten_components=config.model.whiten_components,
             whiten_eps=config.model.whiten_eps,
-            text_visual_weight=config.model.text_visual_weight,
-            text_visual_fusion=config.model.text_visual_fusion,
             foreground_masking=config.model.foreground_masking,
             foreground_soft=config.model.foreground_soft,
-            image_global_weight=config.model.image_global_weight,
-            image_text_weight=config.model.image_text_weight,
             feature_source=feature_source,
             normalise_layers=config.model.normalise_layers,
             projected_weight=config.model.projected_weight,
@@ -935,33 +709,7 @@ def build_baseline(backbone: CLIPBackbone, support_images: Sequence, category: s
             spatial_radius=config.model.spatial_radius,
             spatial_weight=config.model.spatial_weight,
         )
-    return CLIPZeroShotBaseline(
-        backbone,
-        category=category,
-        cache_dir=config.text_embedding_dir,
-        topk_percent=config.fusion.topk_percent,
+    raise ValueError(
+        f"unsupported visual baseline {config.model.baseline!r}; "
+        "use clip_adaptive or clip_fewshot"
     )
-
-
-def otsu_separability(scores: np.ndarray) -> float:
-    """Unsupervised score separability used for feature-source selection.
-
-    A baseline whose image scores form two well-separated modes is more likely
-    to rank normal and anomalous images correctly.  The Otsu between-class
-    variance ratio needs no labels and is computed on a small query subset.
-    """
-    values = np.asarray(scores, dtype=np.float64).reshape(-1)
-    if values.size < 4 or not np.isfinite(values).all():
-        return 0.0
-    values = (values - values.min()) / max(values.max() - values.min(), 1e-9)
-    histogram, edges = np.histogram(values, bins=32, range=(0.0, 1.0))
-    centers = (edges[:-1] + edges[1:]) / 2.0
-    weights = histogram / max(histogram.sum(), 1)
-    cumulative_weight = np.cumsum(weights)
-    cumulative_mean = np.cumsum(weights * centers)
-    total_mean = cumulative_mean[-1]
-    between = (total_mean * cumulative_weight - cumulative_mean) ** 2 / np.maximum(
-        cumulative_weight * (1.0 - cumulative_weight), 1e-9
-    )
-    variance = float(np.var(values))
-    return float(np.max(between) / max(variance, 1e-9))

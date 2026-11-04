@@ -82,8 +82,8 @@ def _leaf_truth(atom_id: str, atom_results: Mapping[str, AtomicResult]) -> float
     truth = _clamp(result.truth)
     weight = _clamp(result.weight)
     # Fractional weights are reliability scores: weight 1 keeps the raw truth,
-    # weight 0 makes the leaf neutral.  This lets transductive reliability
-    # calibration downweight an unstable atom without a hard on/off switch.
+    # weight 0 makes the leaf neutral. The weight is frozen by offline support
+    # compilation and never changes from query-set statistics.
     return _clamp(1.0 - weight * (1.0 - truth))
 
 

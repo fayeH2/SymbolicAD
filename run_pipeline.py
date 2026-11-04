@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Entry point for the staged SymbolicAD V4.0 pipeline.
+"""LLM-free inference entry point for a compiled SymbolicAD program.
 
 Examples
 --------
@@ -23,7 +23,7 @@ from symbolicAD.pipeline import run_categories
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="SymbolicAD V4.0 staged pipeline")
+    parser = argparse.ArgumentParser(description="SymbolicAD static inference")
     parser.add_argument("--config", default="configs/default.yaml")
     parser.add_argument("--mode", choices=["baseline", "baseline_logic", "logic"], default=None)
     parser.add_argument("--dataset", default=None)
@@ -42,8 +42,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="base output directory; each run is placed in a fresh timestamped subdirectory",
     )
-    parser.add_argument("--force-support", action="store_true", help="rebuild support memory")
-    parser.add_argument("--force-rules", action="store_true", help="reload rule templates")
     parser.add_argument("--no-visualizations", action="store_true")
     parser.add_argument("--no-maps", action="store_true")
     parser.add_argument(
@@ -58,17 +56,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="disable the segment-first dynamic-expression MoE supplement",
     )
     parser.add_argument(
-        "--no-qwen-logic",
+        "--no-semantic-rules",
         action="store_true",
-        help="disable Qwen component rules while keeping SymbolicDet enabled",
-    )
-    parser.add_argument(
-        "--allow-transductive",
-        action="store_true",
-        help=(
-            "allow query-distribution feature selection and atom reliability; "
-            "results are marked transductive and are not strict FSAD"
-        ),
+        help="disable the compiled semantic-rule expression tree",
     )
     return parser
 
@@ -110,10 +100,8 @@ def main() -> None:
         config.evaluation.enable_pro = False
     if args.no_symbolicdet:
         config.symbolicdet.enabled = False
-    if args.no_qwen_logic:
+    if args.no_semantic_rules:
         config.logic.enabled = False
-    if args.allow_transductive:
-        config.evaluation.allow_transductive = True
 
     if args.all:
         categories = list(LOCO_CLASSES)
@@ -125,15 +113,10 @@ def main() -> None:
     print(
         f"[SymbolicAD] dataset={config.dataset} categories={categories} "
         f"mode={config.mode} shot={config.shot} device={config.model.device} "
-        f"protocol={'transductive' if config.evaluation.allow_transductive else 'strict'}",
+        "protocol=static-neurosymbolic llm_at_inference=false",
         flush=True,
     )
-    run_categories(
-        config,
-        categories,
-        force_support=args.force_support,
-        force_rules=args.force_rules,
-    )
+    run_categories(config, categories)
     print(f"[SymbolicAD] results written to {Path(config.results_dir).resolve()}")
 
 

@@ -249,7 +249,7 @@ class ResultRenderer:
                     f"{violation.get('feature')}: {float(violation.get('value', 0.0)):.2f} "
                     f"(v={float(violation.get('severity', 0.0)):.2f})"
                 )
-        if logic_result is not None and bool(extra.get("qwen_logic_active", True)):
+        if logic_result is not None and bool(extra.get("semantic_rules_active", True)):
             for failed in getattr(logic_result, "failed_atoms", [])[:6]:
                 lines.append(f"{failed['expression']}: {failed['truth']:.2f}")
         if lines:

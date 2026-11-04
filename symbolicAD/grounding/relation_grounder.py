@@ -13,8 +13,6 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 from symbolicAD.config import Config
-from symbolicAD.models.clip_backbone import CLIPBackbone
-from symbolicAD.models.text_embeddings import encode_prompts_cached
 from symbolicAD.rules.executor import AtomicResult
 from symbolicAD.rules.schema import RelationAtom, RuleKB
 
@@ -328,7 +326,6 @@ def _evaluate_attribute_match(
     scene_graph: SceneGraph,
     support_memory: Optional[SupportMemory],
     config: Config,
-    backbone: Optional[CLIPBackbone],
 ) -> AtomicResult:
     component = atom.components[0]
     attribute = atom.attribute or ""
@@ -369,7 +366,12 @@ def _evaluate_attribute_match(
             dtype=np.float32,
         )
     else:
-        if backbone is None:
+        prototype = (
+            support_memory.attribute_prototypes.get(atom.atom_id)
+            if support_memory is not None
+            else None
+        )
+        if prototype is None:
             return _result(
                 atom,
                 1.0,
@@ -377,18 +379,11 @@ def _evaluate_attribute_match(
                 {
                     "attribute": attribute,
                     "value": value,
-                    "unsupported_backbone": True,
+                    "missing_static_attribute_prototype": True,
                 },
             )
-        embeddings = encode_prompts_cached(
-            backbone,
-            atom.attribute_prompts,
-            cache_dir=config.text_embedding_dir,
-            enabled=config.grounding.text_embedding_cache,
-        )
         features = np.stack([item.feature for item in instances], axis=0)
-        similarities = features @ embeddings.T
-        per_instance = similarities.max(axis=1)
+        per_instance = features @ prototype
     score = float(per_instance.max())
 
     stats: Dict[str, float] = {}
@@ -840,7 +835,6 @@ def evaluate_atoms(
     rule_kb: RuleKB,
     support_memory: Optional[SupportMemory],
     config: Config,
-    backbone: Optional[CLIPBackbone] = None,
 ) -> Dict[str, AtomicResult]:
     results: Dict[str, AtomicResult] = {}
     for atom in rule_kb.atoms:
@@ -865,9 +859,7 @@ def evaluate_atoms(
         elif atom.kind == "CountInRange":
             result = _evaluate_count_in_range(atom, scene_graph, support_memory, config)
         elif atom.kind == "AttributeMatch":
-            result = _evaluate_attribute_match(
-                atom, scene_graph, support_memory, config, backbone
-            )
+            result = _evaluate_attribute_match(atom, scene_graph, support_memory, config)
         elif atom.kind == "PositionMatch":
             result = _evaluate_position_match(
                 atom, scene_graph, support_memory, config

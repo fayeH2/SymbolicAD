@@ -1,11 +1,12 @@
-# SymbolicAD V4.1
+# SymbolicAD V5.1 — static neuro-symbolic FSAD
 
 Staged neuro-symbolic anomaly detection for MVTec LOCO.
 
-The first version is intentionally built to **run end-to-end first, then verify
-and replace individual modules**. For every query image the pipeline produces:
+Qwen is an **offline rule author only**. Deployment inference never loads an
+LLM: CLIP extracts visual features and the frozen neuro-symbolic program
+evaluates its compiled expressions. For every query image the pipeline produces:
 
-- a CLIP zero-shot baseline heat-map;
+- a CLIP visual few-shot baseline heat-map;
 - a component-grounding scene graph (text + support-prototype responses);
 - relation-atom truth values and responsibility maps;
 - a logic heat-map produced from failed rules;
@@ -16,23 +17,22 @@ and replace individual modules**. For every query image the pipeline produces:
 ## Pipeline
 
 ```text
-support images ──► CLIP support memory (prototypes, slots, relation statistics)
-      │                         │
-      └──► rule bank JSON ◄─────┘
-                    │
-query image ─► CLIP patches ─┬─► zero-shot baseline map
-                             └─► component maps ─► instances ─► scene graph
-                                                        │
-                                               relation atoms ─► logic tree
-                                                        │
-                                        responsibility maps + CLIP rescore
-                                                        │
-                                               logic map ─► fusion ─► metrics
+OFFLINE COMPILATION (LLM allowed only in generate_rules.py)
+2 normal supports ─► Qwen rule proposal ─┐
+2 normal supports ─► CLIP patch features ├─► validated static expression tree
+                                        └─► frozen prototypes/thresholds/masks
+
+DEPLOYMENT INFERENCE (LLM forbidden)
+query ─► CLIP patches ─┬─► visual-memory anomaly predicate
+                       ├─► semantic components ─► static rule tree
+                       └─► visual prototypes ─► static dynamic expressions/MoE
+                                                   │
+                                            responsibility map ─► fusion
 ```
 
 ## Stages implemented
 
-- **Stage 1** — data loading, CLIP zero-shot baseline, metrics, heat-maps,
+- **Stage 1** — data loading, CLIP visual few-shot baseline, metrics, heat-maps,
   baseline-only mode, tracked manual rule JSON.
 - **Stage 2** — `Exist` + `CountEq` / `CountInRange` with component maps and
   connected-component instances.
@@ -42,10 +42,11 @@ query image ─► CLIP patches ─┬─► zero-shot baseline map
 - **Rule compiler** — deduplicates atoms, removes implied/redundant atoms,
   calibrates counts from normal support, adds missing count rules and builds a
   hierarchical `AND/OR` tree with an audit report.
-- **Qwen3-VL rule generation** — Qwen3-VL-8B-Thinking inspects the normal support
+- **Offline Qwen3-VL rule generation** — Qwen3-VL-8B-Thinking inspects the normal support
   images, emits a structured component/count/relation/attribute description, and
   a deterministic builder converts it into atoms.  No category-specific rules
-  are hand-written.  Results are cached under `cache/qwen_rules/`.
+  are hand-written. Results are cached, then compiled; inference does not import
+  or call the Qwen generator.
 
 ## Commands
 
@@ -56,12 +57,17 @@ python run_pipeline.py --mode baseline --category juice_bottle --shot 2
 python run_pipeline.py --mode baseline --all --shot 2
 ```
 
-2-shot baseline + logic (automatic Qwen rules and support calibration):
+Compile a 2-shot static program, then run LLM-free inference:
 
 ```bash
+python scripts/generate_rules.py --category juice_bottle --shot 2
+python scripts/compile_static_program.py --category juice_bottle --shot 2 --device cuda:0
 python run_pipeline.py --mode baseline_logic --category juice_bottle --shot 2
-python run_pipeline.py --mode baseline_logic --all --shot 2
 ```
+
+The inference command fails closed if the compiled program is missing or does
+not match the support seed, CLIP model, image size or support images. It never
+regenerates rules or support memory.
 
 Every run writes to a fresh timestamped directory.  If a run was executed with
 `--no-visualizations --no-maps`, the images can be reconstructed later from the
@@ -83,7 +89,7 @@ Other entry points:
 
 ```bash
 python scripts/generate_rules.py --all
-python scripts/build_support_memory.py --category juice_bottle
+python scripts/compile_static_program.py --all
 python scripts/run_inference.py --category juice_bottle --mode baseline_logic
 python scripts/evaluate.py
 ```
@@ -112,17 +118,18 @@ The logic tree only references atom ids:
 {"op": "AND", "children": ["R1", "R2", "R3"]}
 ```
 
-Rules are produced by Qwen3-VL from the support images, then validated and
-compiled.  The local model is `Qwen3-VL-8B-Thinking` (multimodal, so it can
+Rules are produced offline by Qwen3-VL from the support images, then validated
+and compiled. The local model is `Qwen3-VL-8B-Thinking` (multimodal, so it can
 inspect the support images directly).  `configs/rules/*.json` remains only as an
 explicit fallback (`qwen.allow_template_fallback=true`); it is not used for
 normal runs.  The manual `juice_bottle` template has been removed.
 
-The compiler conservatively calibrates counts from support statistics (keeping
-a rule value when support is noisy) and writes
-`cache/rules/{category}.compiled.json` plus `.compile.json`.
-`logic.rescore_enabled` defaults to `false`, so `violation_prompt` does not
-affect heat-maps unless explicitly enabled.
+The compiler conservatively calibrates counts from support statistics and writes
+an immutable deployment package under
+`cache/static_programs/{category}_k{shot}/` containing `rules.json`,
+`support_memory.npz`, `symbolicdet.npz` and `manifest.json`.
+Violation prompts are compile-time documentation only; inference never performs
+text-prompt rescoring.
 
 ## Few-shot baseline (PromptAD / AnomalyCLIP-style)
 
@@ -136,13 +143,9 @@ category name are used:
 - **Local neighbourhood smoothing.** Query/support features are blended with a
   3x3 average (`local_radius`, `local_weight`) before matching.
 - **Fixed ensemble under strict FSAD.** `model.feature_source=both` is fixed
-  before seeing test queries.  The former Otsu `auto` selector remains only as
-  an explicitly enabled transductive ablation (`--allow-transductive`) and its
-  results are marked separately.
-- **Textual normal-vs-damaged branch.** Generic normal/damaged prompts are
-  calibrated on support and fused at image level; the pixel map uses the visual
-  memory branch, because text maps were not spatially reliable in the 2-shot
-  setting.
+  before compilation. Query-time feature-space selection was deleted.
+- **Visual-only anomaly predicate.** The baseline uses normal-support CLIP
+  visual features only. Generic normal/damaged text prompts were removed.
 - **Support-only calibration.** The image score is a top-k statistic of the
   support-calibrated map; optional whitening (`model.whiten`) is available but
   disabled by default because it damaged pixel localisation on LOCO.
@@ -152,14 +155,12 @@ category name are used:
 
 ```text
 native ViT layers ─┐
-projected layer   ─┼─► support patch bank ─► local cosine kNN ─► H_visual
-                   │
-CLIP text prompts ─┴─► normal/damaged logits ─► image-level residual
+projected layer   ─┴─► support patch bank ─► local cosine kNN ─► H_visual
 ```
 
 ## Rule grounding, support calibration and fusion
 
-The Qwen rules are aligned to pixel space in three stages:
+The offline-generated semantic rules are aligned to pixel space in three stages:
 
 1. **Support-calibrated atom truth.**  Each atom is evaluated with a
    leave-one-out support memory.  Atoms whose normal-support truth is low, or
@@ -170,12 +171,10 @@ The Qwen rules are aligned to pixel space in three stages:
    project instance masks weighted by violation severity, not hard binary
    masks.  The logic map is smoothed and normalised by the leave-one-out normal
    logic noise floor.
-3. **Gated fusion.**  Pixel fusion is only enabled when the support logic map is
+3. **Gated fusion.** Pixel fusion is only enabled when the compiled support logic map is
    quiet (`fusion.max_support_logic_noise`); otherwise the symbolic branch
-   abstains.  Strict evaluation never disables atoms from query-set statistics:
-   doing so can erase a valid rule precisely because many anomalies violate it.
-   The old query-frequency filter is available only in transductive ablations.
-   Image-level symbolic evidence is added as a small support-calibrated residual.
+   abstains. Query-set reliability adaptation was deleted. Image-level symbolic
+   evidence is added only from compiled support-calibrated weights.
 
 ```text
 CLIP patches ─┬─► support patch bank ──────────────► H_base
@@ -184,24 +183,25 @@ H_final = 1 - (1 - H_base) * (1 - lambda * H_logic)
 score_final = score_base + beta * score_logic
 ```
 
-Rules are generated automatically by Qwen3-VL; there are no category-specific
-constants, templates or hand-written atoms.  The same pipeline runs for all
-five MVTec LOCO classes.
+Rules are generated offline by Qwen3-VL and compiled into a static expression
+tree. The same LLM-free executor runs for all five MVTec LOCO classes.
 
 ## V5 segment-first SymbolicDet + sparse MoE
 
 The mentor-proposed supplement is implemented in `symbolicAD/symbolicdet` and
-enabled by default in `baseline_logic` mode.  It segments the two normal
-supports, extracts foreground/colour/spatial attributes, fits explicit dynamic
+enabled by default in `baseline_logic` mode. During offline compilation it
+clusters normal CLIP patch features into visual component prototypes, extracts
+colour/spatial attributes from those masks, and fits explicit dynamic
 interval expressions and evaluates appearance, structure and pair-relation
 experts.  A per-image sparse router combines the strongest experts.  Missing
 components are localised with their expected support masks, while relation
 violations assign responsibility to both participating masks.
 
-This branch is fused independently from Qwen logic, so a noisy Qwen rule bank
-may abstain without silently disabling the segment-first result.  Use
-`--no-symbolicdet` for the Qwen-only ablation and `--no-qwen-logic` for the
-SymbolicDet-only ablation.  Every run saves the fitted, human-readable expressions to
+At inference the frozen CLIP prototypes and expressions are only evaluated; no
+fitting occurs. This branch is fused independently from the compiled semantic
+rule tree. Use `--no-symbolicdet` for the semantic-rule-only ablation and
+`--no-semantic-rules` for the SymbolicDet-only ablation. Every run copies the
+human-readable static expressions to
 `checkpoint/<category>_symbolicdet.json`.  The detailed audit and required
 ablation matrix are in `docs/v5_audit.md`.
 
@@ -266,7 +266,7 @@ reference `Seed_111-results.csv`.
 
 Numeric constants are centralised in `configs/default.yaml`. The most important
 knobs are `model.feature_layers`, `model.feature_source`, `model.projected_weight`,
-`grounding.alpha`, `logic.min_atom_support_truth`, `logic.support_calibration`,
+`logic.min_atom_support_truth`, `logic.support_calibration`,
 `fusion.max_support_logic_noise`, `fusion.image_logic_weight`,
 `evaluation.pixel_eval_size` and `output.*`.
 

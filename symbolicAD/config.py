@@ -36,28 +36,17 @@ class ModelConfig:
     whiten: bool = False
     whiten_components: int = 128
     whiten_eps: float = 1.0e-3
-    # Textual (normal-vs-damaged prompt) branch.  Fused harmonically with the
-    # visual memory branch as in PromptAD.
-    text_visual_weight: float = 0.0
-    text_visual_fusion: str = "harmonic"
     foreground_masking: bool = True
     foreground_soft: float = 0.35
     image_score_percent: float = 1.0
-    image_text_weight: float = 0.1
-    image_global_weight: float = 0.0
-    # Fixed by support-only protocol. ``auto`` is a transductive ablation
-    # because it inspects the query score distribution and therefore requires
-    # ``evaluation.allow_transductive`` to be enabled explicitly.
+    # Fixed before deployment; query-time feature-source selection is forbidden.
     feature_source: str = "both"
     projected_weight: float = 0.25
-    auto_select_samples: int = 120
-    auto_margin: float = 0.08
     normalise_layers: bool = False
 
 
 @dataclass
 class GroundingConfig:
-    alpha: float = 0.5
     component_threshold: float = 0.55
     min_instance_area: int = 2
     morphology_kernel: int = 1
@@ -74,15 +63,11 @@ class LogicConfig:
     ratio_sigma: float = 0.25
     lambda_feature: float = 0.3
     lambda_relation: float = 0.5
-    lambda_pair_prompt: float = 0.2
     dummy_match_cost: float = 0.5
     spatial_temperature: float = 1.0
-    eta: float = 0.5
-    rescore_temperature: float = 0.07
     color_sigma: float = 0.18
     fail_threshold: float = 0.5
     and_epsilon: float = 1e-6
-    rescore_enabled: bool = False
     # Convert raw atom truths into support-relative normalities.  An atom whose
     # support truth is already low is a grounding failure, not an anomaly cue.
     support_calibration: bool = True
@@ -97,6 +82,8 @@ class LogicConfig:
 
 @dataclass
 class QwenConfig:
+    """Offline rule-author settings; never consumed by inference pipeline."""
+
     enabled: bool = True
     model_path: str = "/home/hjh/AgentModels/Qwen3-VL-8B-Thinking"
     device: str = "cuda:1"
@@ -146,17 +133,12 @@ class FusionConfig:
 
 @dataclass
 class SymbolicDetConfig:
-    """Support-only segmentation, dynamic expressions and sparse MoE."""
+    """Static CLIP-patch segmentation, expressions and sparse MoE."""
 
     enabled: bool = True
-    analysis_size: int = 128
-    color_clusters: int = 4
+    visual_prototypes: int = 4
     grid_rows: int = 4
     grid_cols: int = 4
-    min_segment_area_ratio: float = 0.0015
-    max_segments: int = 48
-    foreground_color_distance: float = 0.08
-    morphology_kernel: int = 3
     relative_margin: float = 0.15
     occupancy_margin: float = 0.04
     color_margin: float = 0.06
@@ -179,9 +161,6 @@ class EvaluationConfig:
     pro_fpr_limit: float = 0.30
     pro_thresholds: int = 64
     enable_pro: bool = True
-    # Strict FSAD never adapts model/rule choices on the test query set. This
-    # opt-in switch exists only for clearly labelled transductive ablations.
-    allow_transductive: bool = False
 
 
 @dataclass

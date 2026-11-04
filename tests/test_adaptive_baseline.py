@@ -8,19 +8,8 @@ from symbolicAD.models.baseline_adapter import (
     _apply_whitening,
     _fit_whitening,
     _local_smooth,
-    otsu_separability,
 )
-from symbolicAD.pipeline import _transductive_atom_reliability
 from symbolicAD.rules.executor import AtomicResult
-
-
-def test_otsu_separability_prefers_bimodal_scores():
-    rng = np.random.default_rng(0)
-    unimodal = rng.normal(0.5, 0.05, size=200)
-    bimodal = np.concatenate(
-        [rng.normal(0.2, 0.02, size=100), rng.normal(0.8, 0.02, size=100)]
-    )
-    assert otsu_separability(bimodal) > otsu_separability(unimodal)
 
 
 def test_whitening_helpers_preserve_shapes():
@@ -71,14 +60,3 @@ def test_normalize_logic_map_uses_support_noise_floor():
 def test_default_protocol_is_strict_support_only():
     config = load_config()
     assert config.model.feature_source != "auto"
-    assert config.evaluation.allow_transductive is False
-
-
-def test_query_failure_frequency_is_only_an_explicit_ablation_helper():
-    result = AtomicResult(
-        "R1", "Above(A,B)", "Above", 0.0, 1.0, np.ones((2, 2)), True
-    )
-    records = [{"atom_results": {"R1": result}} for _ in range(10)]
-    scales, info = _transductive_atom_reliability(records, fail_threshold=0.5)
-    assert scales["R1"] == 0.0
-    assert info["R1"]["failure_rate"] == 1.0

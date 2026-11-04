@@ -186,30 +186,17 @@ def save_run_checkpoint(
         json.dumps(config.to_dict(), ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
-    qwen_dir = config.cache_dir / config.qwen.cache_subdir
     for category in categories:
-        for suffix in (".json", ".description.json", ".raw.txt"):
-            source = qwen_dir / f"{category}_k{config.shot}{suffix}"
+        program = config.cache_dir / "static_programs" / f"{category}_k{config.shot}"
+        for source_name, target_name in (
+            ("rules.json", f"{category}_static_rules.json"),
+            ("support_memory.npz", f"{category}_static_support_memory.npz"),
+            ("symbolicdet.npz", f"{category}_static_symbolicdet.npz"),
+            ("symbolicdet_expressions.json", f"{category}_symbolicdet.json"),
+            ("manifest.json", f"{category}_static_manifest.json"),
+        ):
+            source = program / source_name
             if source.is_file():
-                shutil.copyfile(
-                    source,
-                    layout.checkpoint_dir / f"{category}_rules{suffix}",
-                )
-        memory = config.support_memory_dir / f"{category}_k{config.shot}.npz"
-        if memory.is_file():
-            shutil.copyfile(
-                memory,
-                layout.checkpoint_dir / f"{category}_support_memory_k{config.shot}.npz",
-            )
-        compiled = config.rule_cache_dir / f"{category}.compiled.json"
-        if compiled.is_file():
-            shutil.copyfile(
-                compiled,
-                layout.checkpoint_dir / f"{category}_rules.compiled.json",
-            )
-        compile_report = config.rule_cache_dir / f"{category}.compiled.compile.json"
-        if compile_report.is_file():
-            shutil.copyfile(
-                compile_report,
-                layout.checkpoint_dir / f"{category}_rules.compile_report.json",
-            )
+                target = layout.checkpoint_dir / target_name
+                if source.resolve() != target.resolve():
+                    shutil.copyfile(source, target)

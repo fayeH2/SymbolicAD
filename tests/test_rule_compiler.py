@@ -5,7 +5,12 @@ import numpy as np
 from symbolicAD.config import load_config
 from symbolicAD.grounding.relation_grounder import evaluate_atoms
 from symbolicAD.grounding.scene_graph import ComponentInstance, SceneGraph
-from symbolicAD.grounding.support_memory import ComponentMemory, SupportMemory
+from symbolicAD.grounding.support_memory import (
+    ComponentMemory,
+    SupportMemory,
+    load_support_memory,
+    save_support_memory,
+)
 from symbolicAD.grounding.instance_extractor import named_color_lab
 from symbolicAD.rules.compiler import compile_rule_kb
 from symbolicAD.rules.schema import RuleKB, parse_expression
@@ -197,8 +202,22 @@ def test_position_and_color_atoms_localize_failed_component():
         instances={"Label": [instance]},
         patch_features=np.ones((4, 4, 4), dtype=np.float32),
     )
-    results = evaluate_atoms(scene, rule_kb, support, config, backbone=None)
+    results = evaluate_atoms(scene, rule_kb, support, config)
     assert results["P"].truth < config.logic.fail_threshold
     assert results["P"].responsibility_map.sum() > 0
     assert results["C"].truth < config.logic.fail_threshold
     assert results["C"].evidence["grounding"] == "lab_color"
+
+
+def test_attribute_visual_prototype_survives_static_memory_roundtrip(tmp_path):
+    prototype = np.asarray([0.1, 0.2, 0.3, 0.4], dtype=np.float32)
+    memory = SupportMemory(
+        category="demo",
+        grid_size=(2, 2),
+        feature_dim=4,
+        attribute_prototypes={"A1": prototype},
+        metadata={"support_memory_version": "test"},
+    )
+    path = save_support_memory(memory, tmp_path / "support_memory.npz")
+    restored = load_support_memory(path)
+    np.testing.assert_allclose(restored.attribute_prototypes["A1"], prototype)
