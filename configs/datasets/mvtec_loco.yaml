@@ -1,5 +1,5 @@
 dataset: mvtec_loco
-shot: 4
+shot: 8
 seed: 668
 support_seed: 668
 

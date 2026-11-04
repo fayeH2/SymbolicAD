@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+
+import cv2
 from typing import Dict, Optional, Sequence
 
 import numpy as np
@@ -35,13 +37,20 @@ from .localization.fusion import (
     topk_mean,
 )
 from .localization.responsibility import build_logic_heatmap
-from .models.baseline_adapter import CLIPZeroShotBaseline
+from .models.baseline_adapter import build_baseline
 from .models.clip_backbone import CLIPBackbone
+from .rules.compiler import compile_rule_kb
 from .rules.executor import execute_formula
 from .rules.qwen_rule_generator import load_or_generate_rules
 from .rules.schema import RuleKB
 from .rules.validator import validate_against_support, validate_rule_kb
 from .visualization.render_results import ResultRenderer
+from .visualization.result_layout import (
+    RunLayout,
+    save_run_checkpoint,
+    write_metrics_csv,
+    write_reference_csv,
+)
 
 
 def _support_memory_path(config: Config, category: str) -> Path:
@@ -79,8 +88,17 @@ def _build_scene_graph(
     return scene_graph
 
 
+def _map_score(values: np.ndarray, size: int, topk_percent: float) -> float:
+    resized = cv2.resize(
+        np.asarray(values, dtype=np.float32),
+        (int(size), int(size)),
+        interpolation=cv2.INTER_LINEAR,
+    )
+    return float(topk_mean(resized[None, ...], topk_percent)[0])
+
+
 def _baseline_scores_and_maps(
-    baseline: CLIPZeroShotBaseline,
+    baseline,
     patches: np.ndarray,
     baseline_stats: Dict[str, float],
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -108,14 +126,33 @@ def _prepare_rule_bank(
     config: Config,
     support_memory: Optional[SupportMemory],
     force_rules: bool,
+    support_images=None,
+    rule_kb: Optional[RuleKB] = None,
 ) -> tuple[RuleKB, Dict[str, object]]:
-    rule_kb = load_or_generate_rules(category, config.rule_cache_dir, force=force_rules)
+    if rule_kb is None:
+        rule_kb = load_or_generate_rules(
+            category,
+            config.rule_cache_dir,
+            force=force_rules,
+            support_images=support_images,
+            config=config,
+        )
     rule_kb, structural_report = validate_rule_kb(rule_kb)
+    compile_report = None
     support_report = None
-    if support_memory is not None:
+    if support_memory is not None and config.compiler.enabled:
+        rule_kb, compile_report = compile_rule_kb(rule_kb, support_memory, config)
         support_report = validate_against_support(rule_kb, support_memory)
+        compiled_path = config.rule_cache_dir / f"{category}.compiled.json"
+        rule_kb.save(compiled_path)
+        if compile_report is not None:
+            (compiled_path.with_suffix(".compile.json")).write_text(
+                json.dumps(compile_report.to_dict(), ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
     return rule_kb, {
         "structural": structural_report.to_dict(),
+        "compile": compile_report.to_dict() if compile_report is not None else None,
         "support": support_report.to_dict() if support_report is not None else None,
     }
 
@@ -137,7 +174,6 @@ def run_category(
 
     support_paths = select_support(class_root, config.shot, config.support_seed)
     support_images = [load_image(path) for path in support_paths]
-
     owns_backbone = backbone is None
     if backbone is None:
         backbone = CLIPBackbone(
@@ -146,12 +182,7 @@ def run_category(
             image_size=config.model.image_size,
         )
 
-    baseline = CLIPZeroShotBaseline(
-        backbone,
-        category=category,
-        cache_dir=config.text_embedding_dir,
-        topk_percent=config.fusion.topk_percent,
-    )
+    baseline = build_baseline(backbone, support_images, category, config)
 
     use_logic = config.mode in {"baseline_logic", "logic"}
     support_memory: Optional[SupportMemory] = None
@@ -160,9 +191,25 @@ def run_category(
 
     memory_path = _support_memory_path(config, category)
     if use_logic:
+        rule_kb = load_or_generate_rules(
+            category,
+            config.rule_cache_dir,
+            force=force_rules,
+            support_images=support_images,
+            config=config,
+        )
+        rule_kb, _ = validate_rule_kb(rule_kb)
+        expected_components = [symbol.name for symbol in rule_kb.components]
         if memory_path.is_file() and not force_support:
             support_memory = load_support_memory(memory_path)
-            if not support_memory.baseline_stats:
+            cached_components = support_memory.metadata.get("component_names")
+            if cached_components is None or list(cached_components) != expected_components:
+                print(
+                    f"[SymbolicAD] support memory incompatible for {category}; rebuilding",
+                    flush=True,
+                )
+                support_memory = None
+            elif not support_memory.baseline_stats:
                 support_memory.baseline_stats = baseline.support_statistics(
                     support_images,
                     low_quantile=config.grounding.support_quantile_low,
@@ -170,14 +217,19 @@ def run_category(
                 )
                 save_support_memory(support_memory, memory_path)
         else:
-            rule_kb = load_or_generate_rules(category, config.rule_cache_dir, force=force_rules)
-            rule_kb, _ = validate_rule_kb(rule_kb)
+            support_memory = None
+        if support_memory is None:
             support_memory = build_support_memory(
                 backbone, support_images, rule_kb, config, baseline=baseline
             )
             save_support_memory(support_memory, memory_path)
         rule_kb, validation = _prepare_rule_bank(
-            category, config, support_memory, force_rules
+            category,
+            config,
+            support_memory,
+            force_rules,
+            support_images=support_images,
+            rule_kb=rule_kb,
         )
     else:
         baseline_stats = baseline.support_statistics(
@@ -202,6 +254,8 @@ def run_category(
     for start in range(0, len(samples), batch_size):
         batch = samples[start:start + batch_size]
         images = [load_image(sample.path) for sample in batch]
+        # Baseline and logic share the exact same CLIP patch features.  This is
+        # what keeps the semantic rule space and the visual anomaly map aligned.
         encoded = backbone.encode_images(images)
         patches = encoded["patches"]
         base_maps, raw_scores = _baseline_scores_and_maps(
@@ -235,7 +289,7 @@ def run_category(
                     offset, rule_kb, component_maps, support_memory, patches[offset], config
                 )
                 atom_results = evaluate_atoms(
-                    scene_graph, rule_kb, support_memory, config
+                    scene_graph, rule_kb, support_memory, config, backbone=backbone
                 )
                 logic_result = execute_formula(
                     rule_kb.formula,
@@ -252,11 +306,14 @@ def run_category(
                     logic_result=logic_result,
                 )
                 final_map = fuse_maps(base_map, logic_map, config.fusion.lambda_logic)
-                base_score = float(
-                    topk_mean(base_map[None, ...], config.fusion.topk_percent)[0]
+                score_size = int(config.evaluation.pixel_eval_size)
+                base_score = _map_score(
+                    base_map, score_size, config.fusion.topk_percent
                 )
                 logic_score = logic_image_score(
-                    logic_map, logic_result.root_truth, config.fusion.topk_percent
+                    cv2.resize(logic_map, (score_size, score_size)),
+                    logic_result.root_truth,
+                    config.fusion.topk_percent,
                 )
                 final_score = final_image_score(
                     base_score, logic_score, config.fusion.beta
@@ -274,8 +331,9 @@ def run_category(
                 }
             else:
                 final_map = base_map
-                base_score = float(
-                    topk_mean(base_map[None, ...], config.fusion.topk_percent)[0]
+                score_size = int(config.evaluation.pixel_eval_size)
+                base_score = _map_score(
+                    base_map, score_size, config.fusion.topk_percent
                 )
                 logic_score = 0.0
                 final_score = base_score
@@ -305,6 +363,7 @@ def run_category(
                 logic_result=logic_result,
                 extra={
                     "image_path": str(sample.path),
+                    "sample_id": sample.image_id,
                     "label": int(sample.label),
                     "group": sample.group,
                     "defect_type": sample.defect_type,
@@ -341,6 +400,10 @@ def run_categories(
     force_support: bool = False,
     force_rules: bool = False,
 ) -> Dict[str, object]:
+    layout = RunLayout.create(config.results_dir, config)
+    config.paths.results_dir = str(layout.root)
+    print(f"[SymbolicAD] run directory: {layout.root}", flush=True)
+
     backbone = CLIPBackbone(
         model_name=config.model.clip_model,
         device=config.model.device,
@@ -360,12 +423,17 @@ def run_categories(
     finally:
         backbone.close()
 
-    results_dir = config.results_dir
+    results_dir = layout.root
     results_dir.mkdir(parents=True, exist_ok=True)
-    (results_dir / "metrics_summary.json").write_text(
-        json.dumps(all_metrics, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    metrics_json = json.dumps(all_metrics, ensure_ascii=False, indent=2) + "\n"
+    (results_dir / "metrics_summary.json").write_text(metrics_json, encoding="utf-8")
+    (layout.checkpoint_dir / "metrics_summary.json").write_text(
+        metrics_json, encoding="utf-8"
     )
-    _write_csv(all_metrics, results_dir / "metrics_per_class.csv")
+    write_reference_csv(all_metrics, layout.csv_dir / "results.csv")
+    write_metrics_csv(all_metrics, layout.csv_dir / "metrics_by_variant.csv")
+    _write_csv(all_metrics, layout.csv_dir / "metrics_per_class.csv")
+    save_run_checkpoint(layout, config, categories)
     return all_metrics
 
 

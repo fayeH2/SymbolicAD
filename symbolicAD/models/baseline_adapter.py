@@ -137,3 +137,134 @@ class CLIPZeroShotBaseline:
             "mean": float(flat.mean()),
             "std": float(flat.std()),
         }
+
+
+class CLIPFewShotBaseline:
+    """Few-shot CLIP baseline: patch distance to normal support patches.
+
+    The baseline deliberately lives in the same CLIP patch space as the
+    component-grounding and rule branches, so the semantic rules and the visual
+    anomaly map can be fused directly.
+    """
+
+    def __init__(
+        self,
+        backbone: CLIPBackbone,
+        support_images: Sequence,
+        topk_percent: float = 1.0,
+        knn: int = 1,
+        max_bank_size: int = 0,
+    ):
+        if not support_images:
+            raise ValueError("few-shot baseline requires at least one support image")
+        self.backbone = backbone
+        self.topk_percent = float(topk_percent)
+        self.knn = max(1, int(knn))
+        encoded = backbone.encode_images(support_images)
+        self.support_patches = np.asarray(encoded["patches"], dtype=np.float32)
+        self.grid_size = (
+            int(self.support_patches.shape[2]),
+            int(self.support_patches.shape[3]),
+        )
+        bank = self.support_patches.transpose(0, 2, 3, 1).reshape(
+            -1, self.support_patches.shape[1]
+        )
+        bank = bank / np.maximum(
+            np.linalg.norm(bank, axis=1, keepdims=True), 1e-8
+        )
+        if max_bank_size and bank.shape[0] > int(max_bank_size):
+            rng = np.random.default_rng(0)
+            indices = rng.choice(bank.shape[0], size=int(max_bank_size), replace=False)
+            bank = bank[indices]
+        self.bank = bank.astype(np.float32)
+        self._stats_cache: Dict[tuple, Dict[str, float]] = {}
+
+    def _raw_maps(self, patches: np.ndarray, bank: np.ndarray) -> np.ndarray:
+        patches = np.asarray(patches, dtype=np.float32)
+        batch, channels, height, width = patches.shape
+        flat = patches.reshape(batch, channels, -1).transpose(0, 2, 1)
+        similarities = flat @ bank.T  # [B, P, N]
+        if self.knn <= 1:
+            best = similarities.max(axis=2)
+        else:
+            k = min(self.knn, similarities.shape[2])
+            best = np.partition(similarities, -k, axis=2)[:, :, -k:].mean(axis=2)
+        return (1.0 - best).reshape(batch, height, width).astype(np.float32)
+
+    def score_from_features(self, patch_features: np.ndarray) -> Dict[str, np.ndarray]:
+        anomaly_map = self._raw_maps(patch_features, self.bank)
+        image_score = topk_mean(anomaly_map, self.topk_percent)
+        return {
+            "anomaly_map": anomaly_map,
+            "image_score": image_score,
+        }
+
+    def forward(self, images: Sequence) -> BaselineOutput:
+        encoded = self.backbone.encode_images(images)
+        scored = self.score_from_features(encoded["patches"])
+        return BaselineOutput(
+            anomaly_map=scored["anomaly_map"],
+            image_score=scored["image_score"],
+            patch_features=encoded["patches"],
+            global_features=encoded["global"],
+            prompt_similarity=None,
+        )
+
+    def _leave_one_out_maps(self) -> np.ndarray:
+        count = self.support_patches.shape[0]
+        if count < 2:
+            raise ValueError(
+                "few-shot baseline needs at least 2 support images for leave-one-out calibration"
+            )
+        maps = []
+        for index in range(count):
+            keep = [item for item in range(count) if item != index]
+            bank = self.support_patches[keep].transpose(0, 2, 3, 1).reshape(
+                -1, self.support_patches.shape[1]
+            )
+            bank = bank / np.maximum(
+                np.linalg.norm(bank, axis=1, keepdims=True), 1e-8
+            )
+            maps.append(
+                self._raw_maps(self.support_patches[index:index + 1], bank)[0]
+            )
+        return np.stack(maps, axis=0)
+
+    def support_statistics(
+        self,
+        support_images: Optional[Sequence] = None,
+        low_quantile: float = 0.5,
+        high_quantile: float = 0.99,
+    ) -> Dict[str, float]:
+        key = (float(low_quantile), float(high_quantile))
+        if key not in self._stats_cache:
+            flat = self._leave_one_out_maps().reshape(-1)
+            self._stats_cache[key] = {
+                "q_low": float(np.quantile(flat, low_quantile)),
+                "q_high": float(np.quantile(flat, high_quantile)),
+                "mean": float(flat.mean()),
+                "std": float(flat.std()),
+            }
+        return dict(self._stats_cache[key])
+
+
+def build_baseline(backbone: CLIPBackbone, support_images: Sequence, category: str, config):
+    """Build the configured baseline in the shared CLIP patch space."""
+    from symbolicAD.config import Config
+
+    if not isinstance(config, Config):
+        raise TypeError("config must be a symbolicAD.config.Config")
+    if config.model.baseline == "clip_fewshot":
+        return CLIPFewShotBaseline(
+            backbone,
+            support_images,
+            topk_percent=config.fusion.topk_percent,
+            knn=config.model.knn,
+            max_bank_size=config.model.max_bank_size,
+        )
+    return CLIPZeroShotBaseline(
+        backbone,
+        category=category,
+        cache_dir=config.text_embedding_dir,
+        topk_percent=config.fusion.topk_percent,
+    )

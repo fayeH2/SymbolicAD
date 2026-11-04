@@ -18,6 +18,11 @@ import numpy as np
 
 from symbolicAD.config import load_config
 from symbolicAD.evaluation.evaluator import CategoryEvaluator
+from symbolicAD.visualization.result_layout import (
+    latest_run_dir,
+    write_metrics_csv,
+    write_reference_csv,
+)
 
 
 def _evaluate_file(path: Path, config) -> dict:
@@ -44,6 +49,9 @@ def main() -> None:
     config = load_config(args.config)
     if args.results_dir:
         config.paths.results_dir = args.results_dir
+    run_dir = latest_run_dir(config.results_dir)
+    if (run_dir / "predictions").is_dir():
+        config.paths.results_dir = str(run_dir)
     predictions_dir = (
         Path(args.predictions_dir)
         if args.predictions_dir
@@ -78,17 +86,20 @@ def main() -> None:
                 )
 
     results_dir = config.results_dir
-    results_dir.mkdir(parents=True, exist_ok=True)
+    csv_dir = results_dir / "csv"
+    csv_dir.mkdir(parents=True, exist_ok=True)
     (results_dir / "metrics_summary.json").write_text(
         json.dumps(all_metrics, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     fieldnames = list(rows[0]) if rows else []
-    with (results_dir / "metrics_per_class.csv").open(
+    with (csv_dir / "metrics_per_class.csv").open(
         "w", newline="", encoding="utf-8"
     ) as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+    write_reference_csv(all_metrics, csv_dir / "results.csv")
+    write_metrics_csv(all_metrics, csv_dir / "metrics_by_variant.csv")
     print(f"wrote {results_dir / 'metrics_summary.json'}")
 
 

@@ -9,6 +9,7 @@ from .schema import (
     parse_expression,
 )
 from .validator import ValidationReport, validate_rule_kb, validate_against_support
+from .compiler import CompileReport, compile_rule_kb
 from .executor import AtomicResult, LogicResult, execute_formula
 
 __all__ = [
@@ -21,6 +22,8 @@ __all__ = [
     "ValidationReport",
     "validate_rule_kb",
     "validate_against_support",
+    "CompileReport",
+    "compile_rule_kb",
     "AtomicResult",
     "LogicResult",
     "execute_formula",

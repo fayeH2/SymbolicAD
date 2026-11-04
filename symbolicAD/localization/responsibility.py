@@ -23,9 +23,14 @@ def build_atom_heatmap(
 ) -> np.ndarray:
     if not atom_result.valid or atom_result.weight <= 0:
         return np.zeros_like(atom_result.responsibility_map, dtype=np.float32)
-    responsibility = rescore_responsibility(
-        atom_result, rule_kb, patch_features, backbone, config
-    )
+    if config.logic.rescore_enabled:
+        responsibility = rescore_responsibility(
+            atom_result, rule_kb, patch_features, backbone, config
+        )
+    else:
+        responsibility = np.asarray(
+            atom_result.responsibility_map, dtype=np.float32
+        )
     return (
         float(atom_result.weight) * (1.0 - float(atom_result.truth)) * responsibility
     ).astype(np.float32)

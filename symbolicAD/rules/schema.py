@@ -12,9 +12,11 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 ALLOWED_ATOM_KINDS = (
     "Exist",
     "CountEq",
+    "CountInRange",
     "CountRatio",
     "OneToOne",
     "SpatialRelation",
+    "AttributeMatch",
 )
 
 SPATIAL_RELATIONS = (
@@ -40,6 +42,8 @@ class ComponentSymbol:
     name: str
     prompts: List[str] = field(default_factory=list)
     synonyms: List[str] = field(default_factory=list)
+    role: str = ""
+    part_of: str = ""
 
     def all_prompts(self) -> List[str]:
         values = list(self.prompts) + list(self.synonyms)
@@ -58,7 +62,15 @@ class ComponentSymbol:
             raise RuleSchemaError("component entry is missing a name")
         prompts = _as_string_list(payload.get("prompts", []))
         synonyms = _as_string_list(payload.get("synonyms", []))
-        return cls(name=name, prompts=prompts, synonyms=synonyms)
+        role = str(payload.get("role", "")).strip()
+        part_of = str(payload.get("part_of", "")).strip()
+        return cls(
+            name=name,
+            prompts=prompts,
+            synonyms=synonyms,
+            role=role,
+            part_of=part_of,
+        )
 
 
 @dataclass
@@ -74,6 +86,11 @@ class RelationAtom:
 
     @property
     def components(self) -> List[str]:
+        """Return only the arguments that reference component symbols."""
+        if self.kind in {"Exist", "CountEq", "CountInRange", "AttributeMatch"}:
+            return [str(self.args[0])] if self.args else []
+        if self.kind in {"CountRatio", "OneToOne", "SpatialRelation"}:
+            return [str(value) for value in self.args[:2]]
         return [str(value) for value in self.args if isinstance(value, str)]
 
     @property
@@ -81,6 +98,27 @@ class RelationAtom:
         if self.kind == "SpatialRelation":
             return str(self.params.get("relation", ""))
         return None
+
+    @property
+    def attribute(self) -> Optional[str]:
+        if self.kind == "AttributeMatch" and len(self.args) >= 2:
+            return str(self.args[1])
+        return None
+
+    @property
+    def attribute_value(self) -> Optional[str]:
+        if self.kind == "AttributeMatch" and len(self.args) >= 3:
+            return str(self.args[2])
+        return None
+
+    @property
+    def attribute_prompts(self) -> List[str]:
+        prompts = _as_string_list(self.params.get("attribute_prompts", []))
+        if prompts:
+            return prompts
+        value = self.attribute_value or ""
+        attribute = self.attribute or "attribute"
+        return [f"a {value} {attribute}", f"{value}", f"{attribute} {value}"]
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "RelationAtom":
@@ -239,7 +277,13 @@ class RuleKB:
         return {
             "category": self.category,
             "components": [
-                {"name": item.name, "prompts": item.prompts, "synonyms": item.synonyms}
+                {
+                    "name": item.name,
+                    "prompts": item.prompts,
+                    "synonyms": item.synonyms,
+                    **({"role": item.role} if item.role else {}),
+                    **({"part_of": item.part_of} if item.part_of else {}),
+                }
                 for item in self.components
             ],
             "atoms": [
@@ -341,12 +385,23 @@ def parse_expression(expression: str) -> tuple[str, List[Any], Dict[str, Any]]:
     elif name == "CountEq":
         if len(args) != 2:
             raise RuleSchemaError("CountEq expects (Component, K)")
+    elif name == "CountInRange":
+        if len(args) != 3:
+            raise RuleSchemaError("CountInRange expects (Component, low, high)")
+        low, high = float(args[1]), float(args[2])
+        if low < 0 or high < low:
+            raise RuleSchemaError("CountInRange requires 0 <= low <= high")
     elif name == "CountRatio":
         if len(args) != 3:
             raise RuleSchemaError("CountRatio expects (A, B, ratio)")
     elif name == "OneToOne":
         if len(args) != 2:
             raise RuleSchemaError("OneToOne expects (A, B)")
+    elif name == "AttributeMatch":
+        if len(args) != 3:
+            raise RuleSchemaError("AttributeMatch expects (Component, attribute, value)")
+        if not str(args[0]).strip() or not str(args[1]).strip() or not str(args[2]).strip():
+            raise RuleSchemaError("AttributeMatch requires non-empty component/attribute/value")
     elif name == "SpatialRelation":
         if len(args) != 3:
             raise RuleSchemaError("SpatialRelation expects (A, B, Relation)")

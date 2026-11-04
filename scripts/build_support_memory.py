@@ -14,7 +14,7 @@ import argparse
 from symbolicAD.config import load_config
 from symbolicAD.datasets.mvtec_loco import LOCO_CLASSES, load_image, select_support
 from symbolicAD.grounding.support_memory import build_support_memory, save_support_memory
-from symbolicAD.models.baseline_adapter import CLIPZeroShotBaseline
+from symbolicAD.models.baseline_adapter import build_baseline
 from symbolicAD.models.clip_backbone import CLIPBackbone
 from symbolicAD.rules.qwen_rule_generator import load_or_generate_rules
 from symbolicAD.rules.validator import validate_rule_kb
@@ -49,11 +49,14 @@ def main() -> None:
             class_root = config.data_root / category
             support_paths = select_support(class_root, config.shot, config.support_seed)
             support_images = [load_image(path) for path in support_paths]
-            rule_kb = load_or_generate_rules(category, config.rule_cache_dir)
-            rule_kb, _ = validate_rule_kb(rule_kb)
-            baseline = CLIPZeroShotBaseline(
-                backbone, category=category, cache_dir=config.text_embedding_dir
+            rule_kb = load_or_generate_rules(
+                category,
+                config.rule_cache_dir,
+                support_images=support_images,
+                config=config,
             )
+            rule_kb, _ = validate_rule_kb(rule_kb)
+            baseline = build_baseline(backbone, support_images, category, config)
             memory = build_support_memory(
                 backbone, support_images, rule_kb, config, baseline=baseline
             )

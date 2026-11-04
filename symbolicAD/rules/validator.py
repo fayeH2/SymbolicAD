@@ -85,16 +85,26 @@ def validate_rule_kb(rule_kb: RuleKB) -> tuple[RuleKB, ValidationReport]:
                 )
                 atom.weight = 0.0
 
-        if atom.kind in {"CountEq", "CountRatio"}:
-            numeric = [value for value in atom.args if isinstance(value, (int, float))]
+        if atom.kind in {"CountEq", "CountInRange", "CountRatio"}:
+            numeric = [value for value in atom.args[1:] if isinstance(value, (int, float))]
             if not numeric or any(not math.isfinite(float(value)) for value in numeric):
                 report.add(f"atom {atom.atom_id!r} has no finite numeric threshold")
                 atom.weight = 0.0
             elif atom.kind == "CountEq" and float(numeric[0]) < 0:
                 report.add(f"atom {atom.atom_id!r} has a negative target count")
                 atom.weight = 0.0
+            elif atom.kind == "CountInRange":
+                low, high = float(atom.args[1]), float(atom.args[2])
+                if low < 0 or high < low:
+                    report.add(f"atom {atom.atom_id!r} has invalid count range")
+                    atom.weight = 0.0
             elif atom.kind == "CountRatio" and float(numeric[0]) < 0:
                 report.add(f"atom {atom.atom_id!r} has a negative target ratio")
+                atom.weight = 0.0
+
+        if atom.kind == "AttributeMatch":
+            if not atom.attribute or not atom.attribute_value:
+                report.add(f"atom {atom.atom_id!r} has an empty attribute/value")
                 atom.weight = 0.0
 
         atom.weight = min(1.0, max(0.0, float(atom.weight)))
@@ -122,10 +132,16 @@ def validate_rule_kb(rule_kb: RuleKB) -> tuple[RuleKB, ValidationReport]:
 def validate_against_support(
     rule_kb: RuleKB,
     support_memory: "SupportMemory",
-    count_tolerance: float = 1.0,
+    count_tolerance: float = 0.5,
     ratio_tolerance: float = 0.5,
+    disable_on_mismatch: bool = False,
 ) -> ValidationReport:
-    """Disable count/ratio atoms that strongly contradict normal support evidence."""
+    """Report or disable count atoms that contradict normal support evidence.
+
+    The rule compiler repairs counts from support statistics first, so the
+    default here is report-only.  ``disable_on_mismatch=True`` restores the
+    old, more aggressive behaviour for callers that want it.
+    """
     report = ValidationReport()
     for atom in rule_kb.atoms:
         if atom.weight <= 0:
@@ -136,13 +152,33 @@ def validate_against_support(
             if memory is None:
                 continue
             expected = float(memory.expected_count)
-            if abs(expected - target) > max(count_tolerance, 0.5 * max(target, 1.0)):
-                atom.weight = 0.0
-                report.dropped_atoms.append(atom.atom_id)
-                report.add(
-                    f"CountEq({atom.components[0]},{target:g}) disabled: support "
-                    f"count is {expected:.2f}"
+            std = float(memory.count_std)
+            tolerance = max(float(count_tolerance), 0.25 * max(target, 1.0))
+            if abs(expected - target) > tolerance:
+                message = (
+                    f"CountEq({atom.components[0]},{target:g}) does not match "
+                    f"support count {expected:.2f} +/- {std:.2f}"
                 )
+                report.add(message)
+                if disable_on_mismatch and abs(expected - target) > tolerance + std:
+                    atom.weight = 0.0
+                    report.dropped_atoms.append(atom.atom_id)
+        elif atom.kind == "CountInRange" and atom.components:
+            low = float(atom.args[1])
+            high = float(atom.args[2])
+            memory = support_memory.components.get(atom.components[0])
+            if memory is None:
+                continue
+            expected = float(memory.expected_count)
+            if expected < low - count_tolerance or expected > high + count_tolerance:
+                message = (
+                    f"CountInRange({atom.components[0]},{low:g},{high:g}) does not "
+                    f"match support count {expected:.2f}"
+                )
+                report.add(message)
+                if disable_on_mismatch:
+                    atom.weight = 0.0
+                    report.dropped_atoms.append(atom.atom_id)
         elif atom.kind == "CountRatio" and len(atom.components) >= 2:
             target = float(atom.args[2]) if len(atom.args) > 2 else 0.0
             mem_a = support_memory.components.get(atom.components[0])
@@ -151,12 +187,14 @@ def validate_against_support(
                 continue
             expected = float(mem_a.expected_count) / max(float(mem_b.expected_count), 1e-6)
             if abs(expected - target) > max(ratio_tolerance, 0.5 * max(target, 1.0)):
-                atom.weight = 0.0
-                report.dropped_atoms.append(atom.atom_id)
-                report.add(
+                message = (
                     f"CountRatio({atom.components[0]},{atom.components[1]},{target:g}) "
-                    f"disabled: support ratio is {expected:.2f}"
+                    f"does not match support ratio {expected:.2f}"
                 )
+                report.add(message)
+                if disable_on_mismatch:
+                    atom.weight = 0.0
+                    report.dropped_atoms.append(atom.atom_id)
 
     for atom_id in rule_kb.formula.atom_ids():
         atom = rule_kb.atom(atom_id)

@@ -1,6 +1,6 @@
 dataset: mvtec_loco
 category: ""
-shot: 4
+shot: 8
 seed: 668
 support_seed: 668
 mode: baseline_logic
@@ -12,6 +12,9 @@ model:
   image_size: 224
   batch_size: 16
   logit_scale: 100.0
+  baseline: clip_fewshot
+  knn: 1
+  max_bank_size: 0
 
 grounding:
   alpha: 0.5
@@ -35,10 +38,32 @@ logic:
   rescore_temperature: 0.07
   fail_threshold: 0.5
   and_epsilon: 1.0e-6
+  rescore_enabled: false
+
+qwen:
+  enabled: true
+  model_path: /home/hjh/AgentModels/Qwen3-VL-8B-Thinking
+  device: cuda:1
+  max_new_tokens: 3000
+  max_image_side: 768
+  cache_subdir: qwen_rules
+  allow_template_fallback: false
+
+compiler:
+  enabled: true
+  deduplicate: true
+  drop_implied_exist: true
+  drop_redundant_one_to_one: true
+  repair_counts: false
+  repair_relation_direction: false
+  add_missing_counts: false
+  stable_count_std: 0.5
+  count_in_range_sigma: 1.0
+  max_count_range_width: 6
 
 fusion:
-  lambda_logic: 0.5
-  beta: 0.5
+  lambda_logic: 0.1
+  beta: 0.1
   topk_percent: 1.0
   map_epsilon: 1.0e-6
 
@@ -55,6 +80,10 @@ output:
   save_visualizations: true
   save_traces: true
   save_predictions: true
+  timestamped: true
+  method_name: SymbolicAD
+  image_size: 400
+  save_reference_images: true
 
 paths:
   data_root: /home/hjh/Desktop/0Datasets/anomaly/industrial/MVTecLOCO/MVTecLOCO

@@ -20,6 +20,9 @@ class ModelConfig:
     image_size: int = 224
     batch_size: int = 16
     logit_scale: float = 100.0
+    baseline: str = "clip_fewshot"
+    knn: int = 1
+    max_bank_size: int = 0
 
 
 @dataclass
@@ -47,12 +50,38 @@ class LogicConfig:
     rescore_temperature: float = 0.07
     fail_threshold: float = 0.5
     and_epsilon: float = 1e-6
+    rescore_enabled: bool = False
+
+
+@dataclass
+class QwenConfig:
+    enabled: bool = True
+    model_path: str = "/home/hjh/AgentModels/Qwen3-VL-8B-Thinking"
+    device: str = "cuda:1"
+    max_new_tokens: int = 3000
+    max_image_side: int = 768
+    cache_subdir: str = "qwen_rules"
+    allow_template_fallback: bool = False
+
+
+@dataclass
+class CompilerConfig:
+    enabled: bool = True
+    deduplicate: bool = True
+    drop_implied_exist: bool = True
+    drop_redundant_one_to_one: bool = True
+    repair_counts: bool = False
+    repair_relation_direction: bool = False
+    add_missing_counts: bool = False
+    stable_count_std: float = 0.5
+    count_in_range_sigma: float = 1.0
+    max_count_range_width: int = 6
 
 
 @dataclass
 class FusionConfig:
-    lambda_logic: float = 0.5
-    beta: float = 0.5
+    lambda_logic: float = 0.1
+    beta: float = 0.1
     topk_percent: float = 1.0
     map_epsilon: float = 1e-6
 
@@ -73,6 +102,10 @@ class OutputConfig:
     save_visualizations: bool = True
     save_traces: bool = True
     save_predictions: bool = True
+    timestamped: bool = True
+    method_name: str = "SymbolicAD"
+    image_size: int = 400
+    save_reference_images: bool = True
 
 
 @dataclass
@@ -95,6 +128,8 @@ class Config:
     model: ModelConfig = field(default_factory=ModelConfig)
     grounding: GroundingConfig = field(default_factory=GroundingConfig)
     logic: LogicConfig = field(default_factory=LogicConfig)
+    qwen: QwenConfig = field(default_factory=QwenConfig)
+    compiler: CompilerConfig = field(default_factory=CompilerConfig)
     fusion: FusionConfig = field(default_factory=FusionConfig)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
@@ -132,6 +167,8 @@ _SECTIONS = {
     "model": ModelConfig,
     "grounding": GroundingConfig,
     "logic": LogicConfig,
+    "qwen": QwenConfig,
+    "compiler": CompilerConfig,
     "fusion": FusionConfig,
     "evaluation": EvaluationConfig,
     "output": OutputConfig,

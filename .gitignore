@@ -63,7 +63,8 @@ evolutionary*.log
 # Data
 /data/
 /datasets/
-*.csv
+# Generated experiment outputs
+/1103results/
 
 # OS
 .DS_Store

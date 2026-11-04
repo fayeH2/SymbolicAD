@@ -1,4 +1,4 @@
-# SymbolicAD V3.2
+# SymbolicAD V4.0
 
 Staged neuro-symbolic anomaly detection for MVTec LOCO.
 
@@ -34,19 +34,25 @@ query image ─► CLIP patches ─┬─► zero-shot baseline map
 
 - **Stage 1** — data loading, CLIP zero-shot baseline, metrics, heat-maps,
   baseline-only mode, tracked manual rule JSON.
-- **Stage 2** — `Exist` + `CountEq` with component maps and connected-component
-  instances.
+- **Stage 2** — `Exist` + `CountEq` / `CountInRange` with component maps and
+  connected-component instances.
 - **Stage 3** — `OneToOne`, `Inside`, `LeftOf`, `RightOf`, `Above`, `Below`,
-  `CenterAligned`, `CountRatio`, Hungarian matching and responsibility
-  back-projection.
-- **Stage 4 (hook only)** — `symbolicAD/rules/qwen_rule_generator.py` keeps the
-  cache/validation interface; Qwen3-VL generation is not called yet.
+  `CenterAligned`, `CountRatio`, `AttributeMatch`, Hungarian matching and
+  responsibility back-projection.
+- **Rule compiler** — deduplicates atoms, removes implied/redundant atoms,
+  calibrates counts from normal support, adds missing count rules and builds a
+  hierarchical `AND/OR` tree with an audit report.
+- **Qwen3-VL rule generation** — Qwen3-VL-8B-Thinking inspects the normal support
+  images, emits a structured component/count/relation/attribute description, and
+  a deterministic builder converts it into atoms.  No category-specific rules
+  are hand-written.  Results are cached under `cache/qwen_rules/`.
 
 ## Commands
 
 Baseline-only smoke run (Stage 1 completion criterion):
 
 ```bash
+python scripts/generate_rules.py --category juice_bottle --shot 8
 python run_pipeline.py --mode baseline --category juice_bottle --max-images 20
 ```
 
@@ -74,10 +80,15 @@ Rule knowledge bases live in `configs/rules/{category}.json` and are cached in
 ```text
 Exist(Component)
 CountEq(Component, K)
+CountInRange(Component, low, high)
 CountRatio(ComponentA, ComponentB, Ratio)
 OneToOne(ComponentA, ComponentB)
 Inside / LeftOf / RightOf / Above / Below / CenterAligned (ComponentA, ComponentB)
+AttributeMatch(Component, attribute, value)
 ```
+
+Components may declare `role` and `part_of`. Attribute alternatives sharing a
+`params.group` are compiled into an `OR` over joint attribute conditions.
 
 The logic tree only references atom ids:
 
@@ -85,21 +96,68 @@ The logic tree only references atom ids:
 {"op": "AND", "children": ["R1", "R2", "R3"]}
 ```
 
-Invalid atoms are disabled (weight 0) instead of terminating the run. Count and
-ratio atoms that contradict normal support statistics are also disabled.
+Rules are produced by Qwen3-VL from the support images, then validated and
+compiled.  The local model is `Qwen3-VL-8B-Thinking` (multimodal, so it can
+inspect the support images directly).  `configs/rules/*.json` remains only as an
+explicit fallback (`qwen.allow_template_fallback=true`); it is not used for
+normal runs.  The manual `juice_bottle` template has been removed.
+
+The compiler conservatively calibrates counts from support statistics (keeping
+a rule value when support is noisy) and writes
+`cache/rules/{category}.compiled.json` plus `.compile.json`.
+`logic.rescore_enabled` defaults to `false`, so `violation_prompt` does not
+affect heat-maps unless explicitly enabled.
+
+## Baseline and semantic-visual fusion
+
+The baseline is **CLIP few-shot**, not zero-shot and not INP-Former.  It builds
+a normal patch bank from the same support images that Qwen uses for rule
+generation, and it uses the same `CLIPBackbone` patch features as component
+grounding:
+
+```text
+CLIP patches ──► normal support patch bank ──► baseline heat-map H_base
+             └─► component maps / atom responsibilities ──► logic heat-map H_logic
+H_final = 1 - (1 - H_base) * (1 - lambda * H_logic)
+```
+
+Thus the symbolic rules and the baseline live in the same CLIP visual-semantic
+space and are fused on the same patch grid.  A pure visual baseline such as
+INP-Former would require an additional projection/alignment mechanism before
+this fusion could be meaningful.
 
 ## Outputs
 
+Every run creates a timestamped directory under the configured results root
+(e.g. `1103results/20261104_140645_k8/`):
+
 ```text
-results/metrics_per_class.csv
-results/metrics_summary.json
-results/visualizations/{category}/{group}_{image}.png
-results/maps/{category}/{group}_{image}_{baseline,logic,final}.npy
-results/traces/{category}/{group}_{image}.json
-results/predictions/{category}.npz
-cache/rules/{category}.json
-cache/support_memory/{category}_k{shot}.npz
+{results_root}/{timestamp}_k{shot}/
+├── csv/
+│   ├── results.csv                 # H2VLR-style per-class i_roc / p_roc / ...
+│   ├── metrics_by_variant.csv      # baseline / logic / final, all groups
+│   └── metrics_per_class.csv       # detailed per class/group/variant
+├── imgs/
+│   ├── {category}-{defect}-{sample}_ori.jpg
+│   ├── {category}-{defect}-{sample}_gt.jpg
+│   └── {category}-{defect}-{sample}_{method}.jpg
+├── checkpoint/
+│   ├── {category}_rules.json
+│   ├── {category}_rules.description.json
+│   ├── {category}_rules.raw.txt
+│   ├── {category}_support_memory_k{shot}.npz
+│   ├── run_config.json
+│   └── metrics_summary.json
+├── maps/{category}/{group}_{sample}_{baseline,logic,final}.npy
+├── traces/{category}/{group}_{sample}.json
+├── predictions/{category}.npz
+└── visualizations/{category}/{group}_{sample}.png
 ```
+
+The three images per sample match the reference layout: original, GT overlay
+(`_gt.jpg`, red mask), and prediction overlay (`_{method}.jpg`, jet heat-map).
+`results.csv` uses percent values and the same `i_roc, p_roc` naming as the
+reference `Seed_111-results.csv`.
 
 ## Configuration
 

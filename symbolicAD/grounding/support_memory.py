@@ -12,6 +12,7 @@ from scipy.optimize import linear_sum_assignment
 
 from symbolicAD.config import Config
 from symbolicAD.models.clip_backbone import CLIPBackbone
+from symbolicAD.models.text_embeddings import encode_prompts_cached
 from symbolicAD.rules.schema import RuleKB
 
 from .component_maps import (
@@ -37,6 +38,8 @@ class ComponentMemory:
     score_q_high: float = 1.0
     expected_count: float = 0.0
     count_std: float = 0.0
+    exist_q05: float = 0.0
+    exist_q50: float = 1.0
     expected_mask: np.ndarray = field(
         default_factory=lambda: np.zeros((1, 1), dtype=np.float32)
     )
@@ -63,6 +66,7 @@ class SupportMemory:
     components: Dict[str, ComponentMemory] = field(default_factory=dict)
     relations: Dict[str, RelationMemory] = field(default_factory=dict)
     baseline_stats: Dict[str, float] = field(default_factory=dict)
+    attribute_stats: Dict[str, Dict[str, float]] = field(default_factory=dict)
     feature_dim: int = 0
     metadata: Dict[str, object] = field(default_factory=dict)
 
@@ -195,6 +199,10 @@ def build_support_memory(
         expected /= float(count)
 
         counts = np.asarray([len(items) for items in image_instances], dtype=np.float64)
+        max_confidences = np.asarray(
+            [max((item.confidence for item in items), default=0.0) for items in image_instances],
+            dtype=np.float64,
+        )
         components[name] = ComponentMemory(
             name=name,
             prototypes=proto,
@@ -203,6 +211,8 @@ def build_support_memory(
             score_q_high=q_high,
             expected_count=float(counts.mean()) if counts.size else 0.0,
             count_std=float(counts.std()) if counts.size else 0.0,
+            exist_q05=float(np.quantile(max_confidences, 0.05)) if max_confidences.size else 0.0,
+            exist_q50=float(np.quantile(max_confidences, 0.50)) if max_confidences.size else 1.0,
             expected_mask=expected.astype(np.float32),
             slot_masks=_slot_masks_from_instances(image_instances, grid_size),
         )
@@ -284,6 +294,38 @@ def build_support_memory(
                     )
                 )
 
+    attribute_stats: Dict[str, Dict[str, float]] = {}
+    for atom in rule_kb.atoms:
+        if atom.kind != "AttributeMatch" or not atom.components:
+            continue
+        component = atom.components[0]
+        if component not in instances_per_component:
+            continue
+        embeddings = encode_prompts_cached(
+            backbone,
+            atom.attribute_prompts,
+            cache_dir=config.text_embedding_dir,
+            enabled=grounding.text_embedding_cache,
+        )
+        scores: List[float] = []
+        for image_index in range(count):
+            instances = instances_per_component[component][image_index]
+            if not instances:
+                continue
+            features = np.stack([item.feature for item in instances], axis=0)
+            similarities = features @ embeddings.T
+            scores.append(float(similarities.max()))
+        if scores:
+            values = np.asarray(scores, dtype=np.float64)
+            attribute_stats[atom.atom_id] = {
+                "q05": float(np.quantile(values, 0.05)),
+                "q50": float(np.quantile(values, 0.50)),
+                "q95": float(np.quantile(values, 0.95)),
+                "mean": float(values.mean()),
+                "std": float(values.std()),
+                "n": int(values.size),
+            }
+
     baseline_stats: Dict[str, float] = {}
     if baseline is not None:
         baseline_stats = baseline.support_statistics(
@@ -298,6 +340,7 @@ def build_support_memory(
         components=components,
         relations=relations,
         baseline_stats=baseline_stats,
+        attribute_stats=attribute_stats,
         feature_dim=int(patches.shape[1]),
         metadata={
             "support_count": int(count),
@@ -305,6 +348,12 @@ def build_support_memory(
             "seed": int(config.support_seed),
             "alpha": float(grounding.alpha),
             "threshold": float(grounding.component_threshold),
+            "component_names": [symbol.name for symbol in rule_kb.components],
+            "attribute_atom_ids": [
+                atom.atom_id
+                for atom in rule_kb.atoms
+                if atom.kind == "AttributeMatch"
+            ],
         },
     )
 
@@ -318,6 +367,7 @@ def save_support_memory(memory: SupportMemory, path: str | Path) -> Path:
         "grid_size": list(memory.grid_size),
         "feature_dim": memory.feature_dim,
         "baseline_stats": memory.baseline_stats,
+        "attribute_stats": memory.attribute_stats,
         "metadata": memory.metadata,
         "components": [],
         "relations": [],
@@ -336,6 +386,8 @@ def save_support_memory(memory: SupportMemory, path: str | Path) -> Path:
                 "score_q_high": component.score_q_high,
                 "expected_count": component.expected_count,
                 "count_std": component.count_std,
+                "exist_q05": component.exist_q05,
+                "exist_q50": component.exist_q50,
             }
         )
     for index, relation in enumerate(memory.relations.values()):
@@ -376,6 +428,8 @@ def load_support_memory(path: str | Path) -> SupportMemory:
                 score_q_high=float(entry["score_q_high"]),
                 expected_count=float(entry["expected_count"]),
                 count_std=float(entry["count_std"]),
+                exist_q05=float(entry.get("exist_q05", 0.0)),
+                exist_q50=float(entry.get("exist_q50", 1.0)),
                 expected_mask=payload[f"{key}_expected_mask"].astype(np.float32),
                 slot_masks=payload[f"{key}_slot_masks"].astype(np.float32),
             )
@@ -406,6 +460,7 @@ def load_support_memory(path: str | Path) -> SupportMemory:
             components=components,
             relations=relations,
             baseline_stats=dict(manifest.get("baseline_stats", {})),
+            attribute_stats=dict(manifest.get("attribute_stats", {})),
             feature_dim=int(manifest.get("feature_dim", 0)),
             metadata=dict(manifest.get("metadata", {})),
         )

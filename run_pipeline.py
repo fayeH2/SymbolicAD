@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Entry point for the staged SymbolicAD V3.2 pipeline.
+"""Entry point for the staged SymbolicAD V4.0 pipeline.
 
 Examples
 --------
@@ -23,7 +23,7 @@ from symbolicAD.pipeline import run_categories
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="SymbolicAD V3.2 staged pipeline")
+    parser = argparse.ArgumentParser(description="SymbolicAD V4.0 staged pipeline")
     parser.add_argument("--config", default="configs/default.yaml")
     parser.add_argument("--mode", choices=["baseline", "baseline_logic", "logic"], default=None)
     parser.add_argument("--dataset", default=None)
@@ -36,7 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--max-images", type=int, default=None, help="limit per test group")
     parser.add_argument("--cache-dir", default=None)
-    parser.add_argument("--results-dir", default=None)
+    parser.add_argument("--results-dir", default="./1103results")
     parser.add_argument("--force-support", action="store_true", help="rebuild support memory")
     parser.add_argument("--force-rules", action="store_true", help="reload rule templates")
     parser.add_argument("--no-visualizations", action="store_true")

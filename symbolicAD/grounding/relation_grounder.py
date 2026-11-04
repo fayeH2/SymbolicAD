@@ -13,6 +13,8 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 from symbolicAD.config import Config
+from symbolicAD.models.clip_backbone import CLIPBackbone
+from symbolicAD.models.text_embeddings import encode_prompts_cached
 from symbolicAD.rules.executor import AtomicResult
 from symbolicAD.rules.schema import RelationAtom, RuleKB
 
@@ -82,7 +84,8 @@ def _heuristic_relation(relation: str, instance_a, instance_b) -> float:
         signed = dx if relation == "LeftOf" else -dx
         return _clip01(0.5 + 2.0 * signed)
     if relation in {"Above", "Below"}:
-        signed = -dy if relation == "Above" else dy
+        # y grows downwards: Above(A,B) means A.cy < B.cy, i.e. dy > 0.
+        signed = dy if relation == "Above" else -dy
         return _clip01(0.5 + 2.0 * signed)
     if relation == "CenterAligned":
         return _clip01(1.0 - abs(dx) / 0.25)
@@ -103,12 +106,19 @@ def _evaluate_exist(
         responsibility = _expected_mask(support_memory, component, grid_size)
         evidence = {"count": 0, "missing": True, "localized": bool(responsibility.any())}
     else:
-        truth = _clip01(max(instance.confidence for instance in instances))
+        max_confidence = float(max(instance.confidence for instance in instances))
+        truth = max_confidence
+        if support_memory is not None and support_memory.has_component(component):
+            memory = support_memory.components[component]
+            low = float(memory.exist_q05)
+            high = float(memory.exist_q50)
+            if high > low + 1e-6:
+                truth = _clip01((max_confidence - low) / (high - low))
         responsibility = _component_map(scene_graph, component)
         evidence = {
             "count": len(instances),
             "missing": False,
-            "max_confidence": float(truth),
+            "max_confidence": max_confidence,
             "localized": True,
         }
     return _result(atom, truth, responsibility, evidence)
@@ -124,7 +134,8 @@ def _evaluate_count_eq(
     target = float(atom.args[1])
     instances = scene_graph.instances_for(component)
     grid_size = scene_graph.grid_size()
-    estimated = float(sum(instance.confidence for instance in instances))
+    estimated = float(len(instances))
+    soft_count = float(sum(instance.confidence for instance in instances))
     sigma = max(0.5, float(config.logic.count_sigma) * max(1.0, 0.25 * target))
     truth = _gaussian_truth(estimated, target, sigma)
 
@@ -137,6 +148,7 @@ def _evaluate_count_eq(
         responsibility = _union_masks(extra, grid_size)
         evidence = {
             "estimated_count": estimated,
+            "soft_count": soft_count,
             "target": target,
             "mode": "excess",
             "missing": False,
@@ -150,6 +162,7 @@ def _evaluate_count_eq(
             responsibility = _slot_mask(support_memory, component, grid_size)
         evidence = {
             "estimated_count": estimated,
+            "soft_count": soft_count,
             "target": target,
             "mode": "missing",
             "missing": True,
@@ -158,10 +171,159 @@ def _evaluate_count_eq(
     else:
         evidence = {
             "estimated_count": estimated,
+            "soft_count": soft_count,
             "target": target,
             "mode": "ok",
         }
     return _result(atom, truth, responsibility, evidence)
+
+
+def _evaluate_count_in_range(
+    atom: RelationAtom,
+    scene_graph: SceneGraph,
+    support_memory: Optional[SupportMemory],
+    config: Config,
+) -> AtomicResult:
+    component = atom.components[0]
+    low = float(atom.args[1])
+    high = float(atom.args[2])
+    instances = scene_graph.instances_for(component)
+    count = float(len(instances))
+    grid_size = scene_graph.grid_size()
+    sigma = max(
+        0.5,
+        float(config.logic.count_sigma) * max(1.0, 0.25 * (high - low + 1.0)),
+    )
+
+    responsibility = np.zeros(grid_size, dtype=np.float32)
+    if low <= count <= high:
+        truth = 1.0
+        evidence = {
+            "count": count,
+            "low": low,
+            "high": high,
+            "mode": "ok",
+            "missing": False,
+        }
+    elif count < low:
+        truth = _gaussian_truth(count, low, sigma)
+        covered = _union_masks(instances, grid_size)
+        expected = _expected_mask(support_memory, component, grid_size)
+        responsibility = np.clip(expected - covered, 0.0, 1.0)
+        if not responsibility.any():
+            responsibility = _slot_mask(support_memory, component, grid_size)
+        evidence = {
+            "count": count,
+            "low": low,
+            "high": high,
+            "mode": "missing",
+            "missing": True,
+            "missing_expected_mass": float(responsibility.sum()),
+        }
+    else:
+        truth = _gaussian_truth(count, high, sigma)
+        ordered = sorted(instances, key=lambda item: item.confidence, reverse=True)
+        extra = ordered[int(round(high)):]
+        if not extra:
+            extra = ordered[-1:]
+        responsibility = _union_masks(extra, grid_size)
+        evidence = {
+            "count": count,
+            "low": low,
+            "high": high,
+            "mode": "excess",
+            "missing": False,
+            "extra_instances": [item.instance_id for item in extra],
+        }
+    return _result(atom, truth, responsibility, evidence)
+
+
+def _evaluate_attribute_match(
+    atom: RelationAtom,
+    scene_graph: SceneGraph,
+    support_memory: Optional[SupportMemory],
+    config: Config,
+    backbone: Optional[CLIPBackbone],
+) -> AtomicResult:
+    component = atom.components[0]
+    attribute = atom.attribute or ""
+    value = atom.attribute_value or ""
+    instances = scene_graph.instances_for(component)
+    grid_size = scene_graph.grid_size()
+
+    if not instances:
+        responsibility = _expected_mask(support_memory, component, grid_size)
+        return _result(
+            atom,
+            0.0,
+            responsibility,
+            {
+                "attribute": attribute,
+                "value": value,
+                "count": 0,
+                "missing": True,
+                "localized": bool(responsibility.any()),
+            },
+        )
+
+    if backbone is None:
+        return _result(
+            atom,
+            1.0,
+            np.zeros(grid_size, dtype=np.float32),
+            {
+                "attribute": attribute,
+                "value": value,
+                "unsupported_backbone": True,
+            },
+        )
+
+    embeddings = encode_prompts_cached(
+        backbone,
+        atom.attribute_prompts,
+        cache_dir=config.text_embedding_dir,
+        enabled=config.grounding.text_embedding_cache,
+    )
+    features = np.stack([item.feature for item in instances], axis=0)
+    similarities = features @ embeddings.T
+    per_instance = similarities.max(axis=1)
+    score = float(per_instance.max())
+
+    stats: Dict[str, float] = {}
+    if support_memory is not None:
+        stats = support_memory.attribute_stats.get(atom.atom_id, {})
+    q05 = stats.get("q05")
+    q50 = stats.get("q50")
+    if q05 is not None and q50 is not None and float(q50) > float(q05) + 1e-6:
+        truth = _clip01((score - float(q05)) / (float(q50) - float(q05)))
+        threshold = float(q05)
+    else:
+        truth = _clip01(1.0 / (1.0 + math.exp(-(score - 0.25) / 0.05)))
+        threshold = 0.2
+
+    failing = [
+        instance
+        for instance, similarity in zip(instances, per_instance)
+        if float(similarity) < threshold
+    ]
+    responsibility = _union_masks(failing, grid_size)
+    if not responsibility.any() and truth < config.logic.fail_threshold:
+        responsibility = _component_map(scene_graph, component)
+
+    return _result(
+        atom,
+        truth,
+        responsibility,
+        {
+            "attribute": attribute,
+            "value": value,
+            "score": score,
+            "per_instance_scores": [float(item) for item in per_instance],
+            "q05": q05,
+            "q50": q50,
+            "missing": False,
+        },
+    )
 
 
 def _evaluate_count_ratio(
@@ -461,6 +623,7 @@ def evaluate_atoms(
     rule_kb: RuleKB,
     support_memory: Optional[SupportMemory],
     config: Config,
+    backbone: Optional[CLIPBackbone] = None,
 ) -> Dict[str, AtomicResult]:
     results: Dict[str, AtomicResult] = {}
     for atom in rule_kb.atoms:
@@ -482,6 +645,12 @@ def evaluate_atoms(
             result = _evaluate_exist(atom, scene_graph, support_memory, config)
         elif atom.kind == "CountEq":
             result = _evaluate_count_eq(atom, scene_graph, support_memory, config)
+        elif atom.kind == "CountInRange":
+            result = _evaluate_count_in_range(atom, scene_graph, support_memory, config)
+        elif atom.kind == "AttributeMatch":
+            result = _evaluate_attribute_match(
+                atom, scene_graph, support_memory, config, backbone
+            )
         elif atom.kind == "CountRatio":
             result = _evaluate_count_ratio(atom, scene_graph, support_memory, config)
         elif atom.kind == "OneToOne":
