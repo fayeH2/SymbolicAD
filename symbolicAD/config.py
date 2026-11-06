@@ -152,6 +152,9 @@ class SymbolicDetConfig:
     fusion_weight: float = 0.25
     image_weight: float = 0.05
     min_expression_confidence: float = 0.10
+    # Experimental predicates: enable explicitly in paired ablation runs.
+    prototype_distance: bool = False
+    higher_order: bool = False
 
 
 @dataclass

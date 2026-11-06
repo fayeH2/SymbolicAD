@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Recompute metrics from saved ``results/predictions/{category}.npz`` files."""
+"""Recompute metrics from saved prediction array bundles."""
 
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from pathlib import Path
 import numpy as np
 
 from symbolicAD.config import load_config
+from symbolicAD.array_store import load_array_bundle
 from symbolicAD.evaluation.evaluator import CategoryEvaluator
 from symbolicAD.visualization.result_layout import (
     latest_run_dir,
@@ -26,16 +27,20 @@ from symbolicAD.visualization.result_layout import (
 
 
 def _evaluate_file(path: Path, config) -> dict:
-    with np.load(path, allow_pickle=False) as payload:
-        evaluator = CategoryEvaluator(config)
-        evaluator.labels = payload["labels"].tolist()
-        evaluator.groups = [str(item) for item in payload["groups"].tolist()]
-        evaluator.masks = [item for item in payload["masks"]]
-        for variant in ("baseline", "logic", "final"):
-            evaluator.image_scores[variant] = payload[f"{variant}_scores"].tolist()
-            evaluator.maps[variant] = [item for item in payload[f"{variant}_maps"]]
-        metrics = evaluator.compute()
-    metrics["category"] = path.stem
+    if path.is_dir():
+        payload, _ = load_array_bundle(path)
+    else:
+        legacy = np.load(path, allow_pickle=False)
+        payload = legacy
+    evaluator = CategoryEvaluator(config)
+    evaluator.labels = payload["labels"].tolist()
+    evaluator.groups = [str(item) for item in payload["groups"].tolist()]
+    evaluator.masks = [item for item in payload["masks"]]
+    for variant in ("baseline", "logic", "final"):
+        evaluator.image_scores[variant] = payload[f"{variant}_scores"].tolist()
+        evaluator.maps[variant] = [item for item in payload[f"{variant}_maps"]]
+    metrics = evaluator.compute()
+    metrics["category"] = path.name if path.is_dir() else path.stem
     return metrics
 
 
@@ -57,7 +62,10 @@ def main() -> None:
         if args.predictions_dir
         else config.results_dir / "predictions"
     )
-    files = sorted(predictions_dir.glob("*.npz"))
+    files = sorted(
+        [path for path in predictions_dir.iterdir() if path.is_dir()]
+        or list(predictions_dir.glob("*.npz"))
+    )
     if not files:
         raise FileNotFoundError(f"no prediction files under {predictions_dir}")
 
@@ -65,13 +73,14 @@ def main() -> None:
     rows = []
     for path in files:
         metrics = _evaluate_file(path, config)
-        all_metrics[path.stem] = metrics
+        category = path.name if path.is_dir() else path.stem
+        all_metrics[category] = metrics
         for group, group_payload in metrics["groups"].items():
             for variant in ("baseline", "logic", "final"):
                 item = group_payload[variant]
                 rows.append(
                     {
-                        "category": path.stem,
+                        "category": category,
                         "group": group,
                         "variant": variant,
                         "image_auroc": item["image"].get("auroc"),

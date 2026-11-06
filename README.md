@@ -1,6 +1,29 @@
-# SymbolicAD V5.1 — static neuro-symbolic FSAD
+# SymbolicAD V6.0 — static neuro-symbolic FSAD
 
 Staged neuro-symbolic anomaly detection for MVTec LOCO.
+
+V6.0 keeps the LLM-free deployment contract and adds model components for
+support-only prototype construction and anchor-graph reasoning:
+
+- **Support prototype union.** Normal support masks from multiple shots are
+  merged by one-to-one Hungarian correspondence, so repeated normal components
+  update an existing prototype instead of duplicating it. Each prototype keeps
+  a local leave-one-out acceptance radius; a query mask is anomalous only when
+  it falls outside the corresponding normal acceptance ball.
+- **Appearance path.** A separate nearest-prototype cosine score measures novel
+  appearance without letting attributes or relations change the nearest normal
+  match.
+- **SAM anchor graph.** Repeatable support regions are matched one-to-one,
+  filtered by scale/position stability, and compiled into frozen geometric
+  predicates. Queries may leave anchors unmatched; missing anchors and
+  unmatched query regions emit explicit evidence instead of silent passes.
+- **Inspectable array bundles.** Prediction, support-memory and SymbolicDet
+  artifacts are stored as `.npy` arrays plus a JSON manifest, replacing opaque
+  `.npz` files.
+
+The prototype-union and SAM-anchor components are opt-in model code; the default
+`run_pipeline.py` path remains the compiled semantic-rule tree plus the
+segment-first SymbolicDet MoE.
 
 Qwen is an **offline rule author only**. Deployment inference never loads an
 LLM: CLIP extracts visual features and the frozen neuro-symbolic program
@@ -127,7 +150,9 @@ normal runs.  The manual `juice_bottle` template has been removed.
 The compiler conservatively calibrates counts from support statistics and writes
 an immutable deployment package under
 `cache/static_programs/{category}_k{shot}/` containing `rules.json`,
-`support_memory.npz`, `symbolicdet.npz` and `manifest.json`.
+`support_memory/`, `symbolicdet/` and `manifest.json`. Array bundles contain a
+JSON manifest plus lossless, inspectable `.npy` arrays; new runs never write
+`.npz` files.
 Violation prompts are compile-time documentation only; inference never performs
 text-prompt rescoring.
 
@@ -186,7 +211,7 @@ score_final = score_base + beta * score_logic
 Rules are generated offline by Qwen3-VL and compiled into a static expression
 tree. The same LLM-free executor runs for all five MVTec LOCO classes.
 
-## V5 segment-first SymbolicDet + sparse MoE
+## Segment-first SymbolicDet + sparse MoE
 
 The mentor-proposed supplement is implemented in `symbolicAD/symbolicdet` and
 enabled by default in `baseline_logic` mode. During offline compilation it
@@ -202,28 +227,7 @@ fitting occurs. This branch is fused independently from the compiled semantic
 rule tree. Use `--no-symbolicdet` for the semantic-rule-only ablation and
 `--no-semantic-rules` for the SymbolicDet-only ablation. Every run copies the
 human-readable static expressions to
-`checkpoint/<category>_symbolicdet.json`.  The detailed audit and required
-ablation matrix are in `docs/v5_audit.md`.
-
-## Historical 2-shot results (MVTec LOCO, 448 input)
-
-The table below predates the strict support-only protocol guard and must not be
-used as the final V5 comparison.  New runs record `protocol`, sample limits and
-the effective symbolic fusion weights in every metrics JSON.
-
-Baseline comparison before/after the dense-feature redesign:
-
-| category | image AUROC old → new | pixel AUROC old → new | pixel AP old → new |
-|---|---:|---:|---:|
-| juice_bottle | 0.743 → **0.837** | 0.880 → **0.914** | 0.307 → **0.504** |
-| breakfast_box | 0.713 → **0.822** | 0.863 → **0.903** | 0.356 → **0.600** |
-| pushpins | 0.584 → **0.602** | 0.637 → **0.687** | 0.050 → **0.076** |
-| screw_bag | 0.614 → 0.591 | 0.639 → **0.684** | 0.104 → **0.114** |
-| splicing_connectors | 0.550 → **0.575** | 0.683 → **0.721** | 0.168 → **0.209** |
-
-With symbolic fusion enabled, `juice_bottle` reaches image AUROC **0.847**.
-The rule branch abstains automatically when its support/query calibration is
-unreliable, so it cannot damage the baseline.
+`checkpoint/<category>_symbolicdet.json`.
 
 ## Outputs
 
@@ -244,12 +248,12 @@ Every run creates a timestamped directory under the configured results root
 │   ├── {category}_rules.json
 │   ├── {category}_rules.description.json
 │   ├── {category}_rules.raw.txt
-│   ├── {category}_support_memory_k{shot}.npz
+│   ├── {category}_static_support_memory/
 │   ├── run_config.json
 │   └── metrics_summary.json
 ├── maps/{category}/{group}_{sample}_{baseline,logic,final}.npy
 ├── traces/{category}/{group}_{sample}.json
-├── predictions/{category}.npz
+├── predictions/{category}/         # manifest.json + one .npy per array
 └── visualizations/{category}/{group}_{sample}.png
 ```
 
@@ -269,9 +273,3 @@ knobs are `model.feature_layers`, `model.feature_source`, `model.projected_weigh
 `logic.min_atom_support_truth`, `logic.support_calibration`,
 `fusion.max_support_logic_noise`, `fusion.image_logic_weight`,
 `evaluation.pixel_eval_size` and `output.*`.
-
-## Tests
-
-```bash
-python -m pytest tests -q
-```

@@ -8,6 +8,7 @@ from typing import Optional, Sequence
 
 import numpy as np
 
+from symbolicAD.array_store import load_array_bundle, save_array_bundle
 from .clip_backbone import CLIPBackbone
 
 
@@ -30,17 +31,23 @@ def encode_prompts_cached(
 
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    path = cache_dir / f"{_cache_key(backbone.model_name, prompts)}.npz"
-    if path.is_file():
-        with np.load(path, allow_pickle=False) as payload:
+    key = _cache_key(backbone.model_name, prompts)
+    path = cache_dir / key
+    if path.is_dir():
+        payload, metadata = load_array_bundle(path)
+        if list(metadata.get("prompts", [])) == prompts:
+            return payload["embeddings"].astype(np.float32)
+    legacy_path = cache_dir / f"{key}.npz"
+    if legacy_path.is_file():
+        with np.load(legacy_path, allow_pickle=False) as payload:
             cached_prompts = [str(item) for item in payload["prompts"].tolist()]
             if cached_prompts == prompts:
                 return payload["embeddings"].astype(np.float32)
 
     embeddings = backbone.encode_text(prompts)
-    np.savez_compressed(
+    save_array_bundle(
         path,
-        prompts=np.asarray(prompts, dtype=str),
-        embeddings=embeddings.astype(np.float32),
+        {"embeddings": embeddings.astype(np.float32)},
+        metadata={"prompts": prompts, "model_name": backbone.model_name},
     )
     return embeddings

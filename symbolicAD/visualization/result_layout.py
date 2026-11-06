@@ -45,14 +45,13 @@ class RunLayout:
         timestamp: Optional[str] = None,
     ) -> "RunLayout":
         base_dir = Path(base_dir).expanduser()
-        timestamped = True if config is None else bool(config.output.timestamped)
-        if timestamped:
-            stamp = timestamp or datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            shot = getattr(config, "shot", None) if config is not None else None
-            name = f"{stamp}_k{shot}" if shot else stamp
-            root = base_dir / name
-        else:
-            root = base_dir
+        # Experiment directories are always unique and self-identifying.  The
+        # former opt-out made unrelated runs silently share one top-level
+        # folder and overwrite each other's artifacts.
+        stamp = timestamp or datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        shot = getattr(config, "shot", None) if config is not None else None
+        name = f"{stamp}_k{shot}" if shot else stamp
+        root = base_dir / name
         layout = cls(
             root=root,
             csv_dir=root / "csv",
@@ -190,13 +189,16 @@ def save_run_checkpoint(
         program = config.cache_dir / "static_programs" / f"{category}_k{config.shot}"
         for source_name, target_name in (
             ("rules.json", f"{category}_static_rules.json"),
-            ("support_memory.npz", f"{category}_static_support_memory.npz"),
-            ("symbolicdet.npz", f"{category}_static_symbolicdet.npz"),
+            ("support_memory", f"{category}_static_support_memory"),
+            ("symbolicdet", f"{category}_static_symbolicdet"),
             ("symbolicdet_expressions.json", f"{category}_symbolicdet.json"),
             ("manifest.json", f"{category}_static_manifest.json"),
         ):
             source = program / source_name
-            if source.is_file():
+            if source.exists():
                 target = layout.checkpoint_dir / target_name
                 if source.resolve() != target.resolve():
-                    shutil.copyfile(source, target)
+                    if source.is_dir():
+                        shutil.copytree(source, target, dirs_exist_ok=True)
+                    else:
+                        shutil.copyfile(source, target)

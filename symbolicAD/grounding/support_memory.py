@@ -12,6 +12,7 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 from symbolicAD.config import Config
+from symbolicAD.array_store import load_array_bundle, save_array_bundle
 from symbolicAD.models.clip_backbone import CLIPBackbone, IMAGE_PREPROCESS_VERSION
 from symbolicAD.rules.schema import RuleKB
 
@@ -611,17 +612,18 @@ def save_support_memory(memory: SupportMemory, path: str | Path) -> Path:
         key = f"a{index}"
         payload[f"{key}_prototype"] = np.asarray(prototype, dtype=np.float32)
         manifest["attribute_prototypes"].append({"key": key, "atom_id": atom_id})
-    payload["manifest"] = np.asarray(
-        json.dumps(manifest, ensure_ascii=False, sort_keys=True)
-    )
-    np.savez_compressed(path, **payload)
-    return path
+    return save_array_bundle(path, payload, metadata=manifest)
 
 
 def load_support_memory(path: str | Path) -> SupportMemory:
     path = Path(path)
-    with np.load(path, allow_pickle=False) as payload:
-        manifest = json.loads(str(payload["manifest"].item()))
+    if path.is_file():  # Compatibility with historical compiled programs.
+        with np.load(path, allow_pickle=False) as legacy:
+            manifest = json.loads(str(legacy["manifest"].item()))
+            payload = {key: legacy[key] for key in legacy.files if key != "manifest"}
+    else:
+        payload, manifest = load_array_bundle(path)
+    if payload:
         components: Dict[str, ComponentMemory] = {}
         for entry in manifest["components"]:
             key = entry["key"]

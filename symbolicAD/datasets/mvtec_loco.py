@@ -121,6 +121,11 @@ def collect_test_samples(class_root: str | Path) -> List[TestSample]:
                 / group_dir.name
                 / f"{image_path.stem}_mask.png"
             )
+            # Converted VisA uses the unchanged stem (000.JPG -> 000.png).
+            if not mask_path.is_file():
+                same_stem = class_root / "ground_truth" / group_dir.name / f"{image_path.stem}.png"
+                if same_stem.is_file():
+                    mask_path = same_stem
             samples.append(
                 TestSample(
                     path=image_path,

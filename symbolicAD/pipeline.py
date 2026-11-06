@@ -324,7 +324,9 @@ def run_category(
         images = [load_image(sample.path) for sample in batch]
         # Baseline and logic share the exact same CLIP patch features.  This is
         # what keeps the semantic rule space and the visual anomaly map aligned.
-        encoded = backbone.encode_images(images)
+
+        encoded = backbone.encode_images(images) # 视觉特征输出
+
         patches = encoded["patches"]
         base_maps, base_scores = _baseline_scores_and_maps(
             baseline, encoded, support_memory.baseline_stats, images=images
@@ -599,7 +601,7 @@ def run_category(
 
     if config.output.save_predictions:
         prediction_dir = config.results_dir / "predictions"
-        evaluator.dump_predictions(prediction_dir / f"{category}.npz")
+        evaluator.dump_predictions(prediction_dir / category)
 
     results_dir = config.results_dir
     results_dir.mkdir(parents=True, exist_ok=True)

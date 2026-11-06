@@ -10,16 +10,19 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 import json
 from pathlib import Path
+from itertools import combinations
 from typing import Dict, List, Sequence
 
 import cv2
 import numpy as np
+
+from symbolicAD.array_store import load_array_bundle, save_array_bundle
 from PIL import Image
 
 from symbolicAD.config import SymbolicDetConfig
 
 
-STATIC_SYMBOLICDET_VERSION = "clip_patch_static_v1"
+STATIC_SYMBOLICDET_VERSION = "clip_patch_static_v2"
 
 
 @dataclass
@@ -150,7 +153,7 @@ class SegmentFirstSymbolicDet:
     FAMILIES = ("appearance", "structure", "relation")
 
     def __init__(self, config: SymbolicDetConfig):
-        self.config = config
+        self.config = SymbolicDetConfig(**asdict(config))
         self.visual_prototypes = np.zeros((0, 0), dtype=np.float32)
         self.expressions: List[DynamicExpression] = []
         self.expected_masks: Dict[str, np.ndarray] = {}
@@ -170,7 +173,9 @@ class SegmentFirstSymbolicDet:
             raise ValueError(
                 f"CLIP grid {(height, width)} does not match static program {self.grid_size}"
             )
-        labels = np.argmax(vectors.reshape(-1, channels) @ self.visual_prototypes.T, axis=1)
+        similarities = vectors.reshape(-1, channels) @ self.visual_prototypes.T
+        distances = (1.0 - similarities.max(axis=1)).reshape(height, width)
+        labels = np.argmax(similarities, axis=1)
         labels = labels.reshape(height, width)
         rgb = _rgb_array(image, height, width)
         lab = _lab01(rgb)
@@ -203,6 +208,10 @@ class SegmentFirstSymbolicDet:
                 x0, x1 = col * width // cols, (col + 1) * width // cols
                 cell = np.zeros((height, width), dtype=bool)
                 cell[y0:y1, x0:x1] = True
+                if self.config.prototype_distance and cell.any():
+                    key = f"cell.{row}.{col}.prototype_distance"
+                    features[key] = float(np.quantile(distances[cell], 0.95))
+                    masks[key] = cell.astype(np.float32)
                 for index, cluster_mask in cluster_masks.items():
                     region = cell & cluster_mask
                     key = f"cell.{row}.{col}.cluster.{index}.occupancy"
@@ -231,12 +240,29 @@ class SegmentFirstSymbolicDet:
                     key = f"{prefix}.{name}"
                     features[key] = float(value)
                     masks[key] = pair_mask
+        if self.config.higher_order:
+            # Scale-invariant ternary shape constraints; all symbols and bounds
+            # are discovered from the normal supports, with no category rules.
+            for first, second, third in combinations(cluster_masks, 3):
+                stats = [_mask_geometry(cluster_masks[i]) for i in (first, second, third)]
+                if any(item["area"] <= 0 for item in stats):
+                    continue
+                points = np.asarray([[s["cx"], s["cy"]] for s in stats])
+                a, b = points[1] - points[0], points[2] - points[0]
+                denom = max(float(np.linalg.norm(a) * np.linalg.norm(b)), 1e-6)
+                key = f"relation3.{first}.{second}.{third}.angle_cos"
+                features[key] = float(np.dot(a, b) / denom)
+                masks[key] = np.maximum.reduce(
+                    [cluster_masks[i].astype(np.float32) for i in (first, second, third)]
+                )
         return _Observation(features=features, masks=masks)
 
     @staticmethod
     def _feature_family(key: str) -> str:
-        if key.startswith("relation."):
+        if key.startswith(("relation.", "relation3.")):
             return "relation"
+        if key.endswith(".prototype_distance"):
+            return "appearance"
         if key.endswith((".L", ".a", ".b", ".edge")):
             return "appearance"
         return "structure"
@@ -244,7 +270,7 @@ class SegmentFirstSymbolicDet:
     def _margin(self, key: str, values: np.ndarray) -> float:
         if key.endswith((".L", ".a", ".b", ".edge")):
             floor = float(self.config.color_margin)
-        elif key.endswith((".cx", ".cy", ".dx", ".dy", ".distance")):
+        elif key.endswith((".cx", ".cy", ".dx", ".dy", ".distance", ".angle_cos")):
             floor = float(self.config.position_margin)
         elif key.endswith(".components"):
             floor = float(self.config.count_margin)
@@ -264,6 +290,8 @@ class SegmentFirstSymbolicDet:
         patches = np.asarray(support_patch_features, dtype=np.float32)
         if not support_images or patches.ndim != 4 or patches.shape[0] != len(support_images):
             raise ValueError("fit requires aligned normal images and [K,D,H,W] CLIP features")
+        if not np.isfinite(patches).all():
+            raise ValueError("support features must be finite")
         self.support_count = len(support_images)
         self.grid_size = (int(patches.shape[2]), int(patches.shape[3]))
         vectors = np.concatenate(
@@ -325,15 +353,23 @@ class SegmentFirstSymbolicDet:
         anomaly_map = np.zeros(self.grid_size, dtype=np.float32)
         violations: List[Dict[str, object]] = []
         for expression in self.expressions:
-            if expression.family != family or expression.feature not in observation.features:
+            if expression.family != family:
                 continue
-            value = float(observation.features[expression.feature])
-            severity = expression.violation(value, float(self.config.violation_temperature))
+            missing = expression.feature not in observation.features
+            value = float(observation.features.get(expression.feature, float("nan")))
+            # A compiled relation requires its participants to exist. Missing
+            # query operands are a failed existence guard, never a silent pass.
+            if missing and expression.feature.startswith(("relation.", "relation3.")):
+                severity = 1.0
+            else:
+                severity = expression.violation(value, float(self.config.violation_temperature))
             severity *= expression.confidence
             if severity <= 0.0:
                 continue
             current = observation.masks.get(expression.feature)
             expected = self.expected_masks.get(expression.feature)
+            if missing:
+                current = expected
             if current is None or expected is None:
                 continue
             anomaly_map = np.maximum(anomaly_map, severity * np.maximum(current, expected))
@@ -343,7 +379,8 @@ class SegmentFirstSymbolicDet:
                     "family": family,
                     "expression": expression.text,
                     "feature": expression.feature,
-                    "value": value,
+                    "value": value if np.isfinite(value) else None,
+                    "missing_operand": missing,
                     "severity": float(severity),
                 }
             )
@@ -410,6 +447,7 @@ class SegmentFirstSymbolicDet:
             "feature_source": "clip_projected_patch_features",
             "support_count": int(self.support_count),
             "grid_size": list(self.grid_size),
+            "config": asdict(self.config),
             "expert_weights": dict(self.expert_weights),
             "expressions": [{**asdict(item), "text": item.text} for item in self.expressions],
         }
@@ -419,24 +457,32 @@ class SegmentFirstSymbolicDet:
         path.parent.mkdir(parents=True, exist_ok=True)
         keys = sorted(self.expected_masks)
         masks = np.stack([self.expected_masks[key] for key in keys], axis=0)
-        np.savez_compressed(
+        return save_array_bundle(
             path,
-            manifest=np.asarray(json.dumps(self.to_dict(), ensure_ascii=False)),
-            visual_prototypes=self.visual_prototypes.astype(np.float32),
-            mask_keys=np.asarray(keys),
-            expected_masks=masks.astype(np.float16),
+            {
+                "visual_prototypes": self.visual_prototypes.astype(np.float32),
+                "mask_keys": np.asarray(keys),
+                "expected_masks": masks.astype(np.float16),
+            },
+            metadata=self.to_dict(),
         )
-        return path
 
     @classmethod
     def load(cls, path: str | Path, config: SymbolicDetConfig) -> "SegmentFirstSymbolicDet":
-        payload = np.load(Path(path), allow_pickle=False)
-        manifest = json.loads(str(payload["manifest"].item()))
+        path = Path(path)
+        if path.is_file():
+            legacy = np.load(path, allow_pickle=False)
+            manifest = json.loads(str(legacy["manifest"].item()))
+            payload = legacy
+        else:
+            payload, manifest = load_array_bundle(path)
         if manifest.get("version") != STATIC_SYMBOLICDET_VERSION:
             raise RuntimeError(
                 f"incompatible SymbolicDet program {manifest.get('version')}; recompile"
             )
-        model = cls(config)
+        if manifest.get("config") != asdict(config):
+            raise RuntimeError("SymbolicDet configuration differs from frozen program; recompile")
+        model = cls(SymbolicDetConfig(**manifest["config"]))
         model.support_count = int(manifest["support_count"])
         model.grid_size = tuple(int(value) for value in manifest["grid_size"])
         model.expert_weights = {

@@ -30,8 +30,8 @@ class StaticProgramPaths:
         return cls(
             root=root,
             rules=root / "rules.json",
-            support_memory=root / "support_memory.npz",
-            symbolicdet=root / "symbolicdet.npz",
+            support_memory=root / "support_memory",
+            symbolicdet=root / "symbolicdet",
             manifest=root / "manifest.json",
         )
 
@@ -68,15 +68,23 @@ def load_rule_program(paths: StaticProgramPaths) -> RuleKB:
 
 def load_grounding_memory(paths: StaticProgramPaths) -> SupportMemory:
     load_manifest(paths)
-    if not paths.support_memory.is_file():
-        raise FileNotFoundError(paths.support_memory)
-    return load_support_memory(paths.support_memory)
+    source = paths.support_memory
+    legacy = source.with_suffix(".npz")
+    if not source.exists() and legacy.is_file():
+        source = legacy
+    if not source.exists():
+        raise FileNotFoundError(source)
+    return load_support_memory(source)
 
 
 def load_symbolicdet_program(
     paths: StaticProgramPaths, config: Config
 ) -> SegmentFirstSymbolicDet:
     load_manifest(paths)
-    if not paths.symbolicdet.is_file():
-        raise FileNotFoundError(paths.symbolicdet)
-    return SegmentFirstSymbolicDet.load(paths.symbolicdet, config.symbolicdet)
+    source = paths.symbolicdet
+    legacy = source.with_suffix(".npz")
+    if not source.exists() and legacy.is_file():
+        source = legacy
+    if not source.exists():
+        raise FileNotFoundError(source)
+    return SegmentFirstSymbolicDet.load(source, config.symbolicdet)

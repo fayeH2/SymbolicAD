@@ -10,6 +10,7 @@ import cv2
 import numpy as np
 
 from symbolicAD.config import Config
+from symbolicAD.array_store import save_array_bundle
 
 from .image_metrics import image_metrics
 from .pixel_metrics import pixel_metrics
@@ -134,4 +135,4 @@ class CategoryEvaluator:
                 if self.maps[variant]
                 else np.zeros((0,))
             )
-        np.savez_compressed(path, **payload)
+        save_array_bundle(path, payload)

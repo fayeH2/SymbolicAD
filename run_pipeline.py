@@ -30,7 +30,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--category", default=None, help="single category name")
     parser.add_argument("--all", action="store_true", help="run every LOCO class")
     parser.add_argument("--data-root", default=None)
-    parser.add_argument("--shot", type=int, default=None)
+    parser.add_argument("--shot", type=int, default = 2)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--image-size", type=int, default=None)
@@ -39,7 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-dir", default=None)
     parser.add_argument(
         "--results-dir",
-        default=None,
+        default="./results_1105_val",
         help="base output directory; each run is placed in a fresh timestamped subdirectory",
     )
     parser.add_argument("--no-visualizations", action="store_true")

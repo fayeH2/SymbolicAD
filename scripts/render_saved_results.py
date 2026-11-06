@@ -3,7 +3,7 @@
 
 The full experiments are often executed with ``--no-visualizations --no-maps``
 for speed.  This script reconstructs the visual outputs from the saved
-``predictions/{category}.npz`` and ``traces/{category}/*.json`` without running
+``predictions/{category}/`` and ``traces/{category}/*.json`` without running
 CLIP again.
 """
 
@@ -20,6 +20,7 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
 import numpy as np
 
 from symbolicAD.config import load_config
+from symbolicAD.array_store import load_array_bundle
 from symbolicAD.datasets.mvtec_loco import load_gt_mask, load_image
 from symbolicAD.rules.executor import LogicResult
 from symbolicAD.visualization.render_results import ResultRenderer
@@ -87,14 +88,20 @@ def render_run(run_dir: Path, limit: int = 0) -> None:
 
     for category in metrics:
         trace_dir = run_dir / "traces" / category
-        prediction_path = run_dir / "predictions" / f"{category}.npz"
-        if not trace_dir.is_dir() or not prediction_path.is_file():
+        prediction_path = run_dir / "predictions" / category
+        legacy_prediction = run_dir / "predictions" / f"{category}.npz"
+        if not prediction_path.is_dir() and legacy_prediction.is_file():
+            prediction_path = legacy_prediction
+        if not trace_dir.is_dir() or not prediction_path.exists():
             print(f"[render] skip {category}: missing traces or predictions")
             continue
         traces = sorted(trace_dir.glob("*.json"))
         if limit > 0:
             traces = traces[:limit]
-        payload = np.load(prediction_path, allow_pickle=False)
+        if prediction_path.is_dir():
+            payload, _ = load_array_bundle(prediction_path)
+        else:
+            payload = np.load(prediction_path, allow_pickle=False)
         maps = {
             name: payload[f"{name}_maps"].astype(np.float32)
             for name in ("baseline", "logic", "final")
